@@ -1,0 +1,5 @@
+dearpygui
+numpy
+opencv-python
+pillow
+vtracer
