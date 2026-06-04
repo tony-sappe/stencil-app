@@ -72,6 +72,7 @@ class StencilApp:
         self._last_config = None
         self._last_binary = None
         self._last_crop = None
+        self._last_process_input = None
 
         # For square crop selection on original
         self.full_pil = None
@@ -88,6 +89,7 @@ class StencilApp:
         self._drag_start_rect = None
         self._drag_start_mouse = None
         self._last_drag_end_ts = 0.0
+        self._crop_changed = False
 
         self._build_ui()
 
@@ -131,7 +133,7 @@ class StencilApp:
 
         dpg.create_viewport(
             title="Phone Photo → Screen Print Vector",
-            width=1450,
+            width=1420,
             height=880,
             resizable=True,
         )
@@ -145,133 +147,145 @@ class StencilApp:
                 dpg.add_button(label="Open SVG", callback=self.open_svg, width=110)
                 dpg.add_button(label="Reset Crop", callback=self._reset_crop, width=95)
 
-            dpg.add_separator()
+            # Fixed-height panels: width 690, tall enough for controls but not full-window stretch.
+            settings_col_w = 690
+            settings_panel_h = 300
+            settings_slider_w = 360
+            with dpg.group(horizontal=True, tag="settings_row"):
+                with dpg.child_window(
+                    tag="settings_col_preprocess",
+                    width=settings_col_w,
+                    height=settings_panel_h,
+                    border=False,
+                    no_scrollbar=True,
+                ):
+                    with dpg.collapsing_header(label="Preprocessing settings", default_open=True):
+                        dpg.add_slider_int(
+                            label="Denoise Strength",
+                            tag="slider_denoise",
+                            default_value=15,
+                            min_value=0,
+                            max_value=40,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_float(
+                            label="Blur Radius",
+                            tag="slider_blur",
+                            default_value=1.5,
+                            min_value=0.0,
+                            max_value=5.0,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_int(
+                            label="Threshold Offset",
+                            tag="slider_threshold",
+                            default_value=5,
+                            min_value=-20,
+                            max_value=20,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_int(
+                            label="Adaptive Block Size",
+                            tag="slider_block_size",
+                            default_value=11,
+                            min_value=3,
+                            max_value=31,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_int(
+                            label="Min Area (speckle filter)",
+                            tag="slider_min_area",
+                            default_value=25,
+                            min_value=10,
+                            max_value=100,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_float(
+                            label="Line width (px)",
+                            tag="slider_line_width",
+                            default_value=0.0,
+                            min_value=0.0,
+                            max_value=12.0,
+                            format="%.1f",
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_checkbox(
+                            label="Invert Image",
+                            tag="check_invert",
+                            default_value=False,
+                            callback=self.update_preview,
+                        )
 
-            with dpg.collapsing_header(label="Preprocessing settings", default_open=True):
-                dpg.add_slider_int(
-                    label="Denoise Strength",
-                    tag="slider_denoise",
-                    default_value=15,
-                    min_value=0,
-                    max_value=40,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_float(
-                    label="Blur Radius",
-                    tag="slider_blur",
-                    default_value=1.5,
-                    min_value=0.0,
-                    max_value=5.0,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Threshold Offset",
-                    tag="slider_threshold",
-                    default_value=5,
-                    min_value=-20,
-                    max_value=20,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Adaptive Block Size",
-                    tag="slider_block_size",
-                    default_value=11,
-                    min_value=3,
-                    max_value=31,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Min Area (speckle filter)",
-                    tag="slider_min_area",
-                    default_value=25,
-                    min_value=10,
-                    max_value=100,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Line Thickening",
-                    tag="slider_line_thickness",
-                    default_value=0,
-                    min_value=0,
-                    max_value=3,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_checkbox(
-                    label="Invert Image",
-                    tag="check_invert",
-                    default_value=False,
-                    callback=self.update_preview,
-                )
+                with dpg.child_window(
+                    tag="settings_col_vector",
+                    width=settings_col_w,
+                    height=settings_panel_h,
+                    border=False,
+                    no_scrollbar=True,
+                ):
+                    with dpg.collapsing_header(label="Vector settings", default_open=True):
+                        dpg.add_text(
+                            "Center = binary sent to tracer. Right = traced curves.",
+                            color=(160, 180, 200),
+                        )
+                        dpg.add_button(
+                            label="Match preprocessed preview",
+                            callback=self._apply_match_preprocess_preset,
+                            width=220,
+                        )
+                        dpg.add_combo(
+                            label="Trace mode",
+                            tag="combo_trace_mode",
+                            items=list(self.TRACE_MODES),
+                            default_value="Polygon",
+                            callback=self.update_preview,
+                            width=220,
+                        )
+                        dpg.add_slider_float(
+                            label="Path fidelity",
+                            tag="slider_detail",
+                            default_value=1.0,
+                            min_value=_DETAIL_MIN,
+                            max_value=_DETAIL_MAX,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_int(
+                            label="Corner threshold (deg)",
+                            tag="slider_corner",
+                            default_value=30,
+                            min_value=0,
+                            max_value=180,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_int(
+                            label="Splice threshold (deg)",
+                            tag="slider_splice_threshold",
+                            default_value=45,
+                            min_value=0,
+                            max_value=180,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
+                        dpg.add_slider_int(
+                            label="Extra vector speckle filter (px)",
+                            tag="slider_vector_speckle",
+                            default_value=0,
+                            min_value=0,
+                            max_value=80,
+                            callback=self.update_preview,
+                            width=settings_slider_w,
+                        )
 
-            with dpg.collapsing_header(label="Vector settings", default_open=True):
-                dpg.add_text(
-                    "The center preview is the exact binary image sent to the tracer. "
-                    "The right preview is simplified curves — use Match preprocessed or raise Path fidelity.",
-                    color=(160, 180, 200),
-                )
-                dpg.add_button(
-                    label="Match preprocessed preview",
-                    callback=self._apply_match_preprocess_preset,
-                    width=220,
-                )
-                dpg.add_combo(
-                    label="Trace mode",
-                    tag="combo_trace_mode",
-                    items=list(self.TRACE_MODES),
-                    default_value="Polygon",
-                    callback=self.update_preview,
-                    width=220,
-                )
-                dpg.add_slider_float(
-                    label="Path fidelity",
-                    tag="slider_detail",
-                    default_value=1.0,
-                    min_value=_DETAIL_MIN,
-                    max_value=_DETAIL_MAX,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Corner threshold (deg)",
-                    tag="slider_corner",
-                    default_value=30,
-                    min_value=0,
-                    max_value=180,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Splice threshold (deg)",
-                    tag="slider_splice_threshold",
-                    default_value=45,
-                    min_value=0,
-                    max_value=180,
-                    callback=self.update_preview,
-                    width=380,
-                )
-                dpg.add_slider_int(
-                    label="Extra vector speckle filter (px)",
-                    tag="slider_vector_speckle",
-                    default_value=0,
-                    min_value=0,
-                    max_value=80,
-                    callback=self.update_preview,
-                    width=380,
-                )
-
-            dpg.add_separator()
-
-            dpg.add_text(
-                "Load an image — previews update when you stop moving a slider or release the mouse. "
-                "⏳ shows while processing. Drag the yellow square on Original to crop (output is always square).",
-                color=(200, 200, 140),
-            )
+            dpg.add_spacer(height=8)
+            dpg.add_text(tag="loading_indicator", default_value="", color=(255, 180, 100))
 
             # Labels above bordered preview boxes (images fill the boxes exactly)
             with dpg.group(horizontal=True):
@@ -302,7 +316,6 @@ class StencilApp:
             dpg.add_spacer(height=4)
             dpg.add_text(tag="crop_info_text", default_value="")
             dpg.add_text(tag="status_text", default_value="Load a photo to begin. Changes to sliders/checkbox update the vector preview live.")
-            dpg.add_text(tag="loading_indicator", default_value="", color=(255, 180, 100))
 
         # File dialogs (robust path extraction in callbacks to handle .* filter etc.)
         with dpg.file_dialog(
@@ -395,7 +408,7 @@ class StencilApp:
             "threshold_offset": dpg.get_value("slider_threshold"),
             "block_size": dpg.get_value("slider_block_size"),
             "min_area": dpg.get_value("slider_min_area"),
-            "line_thickness": dpg.get_value("slider_line_thickness"),
+            "line_width_px": float(dpg.get_value("slider_line_width")),
             "corner_threshold": dpg.get_value("slider_corner"),
             "splice_threshold": dpg.get_value("slider_splice_threshold"),
             "trace_mode": dpg.get_value("combo_trace_mode"),
@@ -486,13 +499,20 @@ class StencilApp:
         min_area = int(config.get("min_area", 25))
         cleaned = self._filter_small_components(cleaned, min_area)
 
-        # Optional line thickening (dilation) after cleaning. Makes stencil lines more durable for screen printing.
-        thickness = int(config.get("line_thickness", 0))
-        if thickness > 0:
-            kernel = np.ones((3, 3), np.uint8)
-            cleaned = cv2.dilate(cleaned, kernel, iterations=thickness)
+        cleaned = self._thicken_ink_lines(cleaned, float(config.get("line_width_px", 0.0)))
 
         return cleaned
+
+    def _thicken_ink_lines(self, binary: np.ndarray, width_px: float) -> np.ndarray:
+        """Expand dark ink (0) so higher line width = thicker stencil lines on screen."""
+        if width_px <= 0 or binary is None:
+            return binary
+        # Kernel diameter from requested width (odd, at least 3px for visible effect).
+        ksize = max(3, int(round(width_px)) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        ink = (binary == 0).astype(np.uint8) * 255
+        ink = cv2.dilate(ink, kernel, iterations=1)
+        return np.where(ink > 0, 0, 255).astype(np.uint8)
 
     def _filter_small_components(self, binary: np.ndarray, min_area: int) -> np.ndarray:
         """Remove small connected components (8-way) of *either* color below min_area by flipping them.
@@ -740,6 +760,7 @@ class StencilApp:
     def _on_mouse_drag(self, sender, app_data, user_data):
         if self._is_dragging and not dpg.is_mouse_button_down(0):
             self._end_crop_drag()
+            self._finish_crop_interaction()
             return
         if not self._is_dragging or not self.crop_rect or not self.full_pil:
             return
@@ -790,17 +811,33 @@ class StencilApp:
             self.crop_rect = (int(nx), int(ny), int(ns))
         self._apply_crop()
         self._update_selection_visual()
+        self._crop_changed = True
         self._last_slider_change = time.time()
         self._dirty = True
+
+    def _flush_preview_update(self):
+        """Run preprocess + vector now (crop release, reset crop, initial load)."""
+        if not self.input_path:
+            return
+        self._dirty = False
+        self._do_update_preview()
+
+    def _finish_crop_interaction(self):
+        """Apply crop and refresh all previews once per drag (safe if called twice)."""
+        if not self._crop_changed:
+            return
+        self._crop_changed = False
+        self._last_crop = None
+        if not self.input_path:
+            return
+        dpg.set_value("status_text", "Crop updated — refreshing previews…")
+        self._flush_preview_update()
 
     def _on_mouse_release_crop(self, sender, app_data, user_data):
         if self._is_dragging:
             _verbose_log(f"[CROP] RELEASE (app_data={app_data})", verbose=self.verbose)
             self._end_crop_drag()
-            current = dpg.get_value("status_text") or ""
-            if "Dragging crop" in current:
-                dpg.set_value("status_text", "Crop drag released — applying change...")
-            # existing global release will force if dirty (which will run _do_update_preview and overwrite status)
+        self._finish_crop_interaction()
 
     def _on_mouse_move(self, sender, app_data, user_data):
         """Fallback for starting a crop drag on trackpads / devices where the mouse_down
@@ -813,6 +850,7 @@ class StencilApp:
         if self._is_dragging:
             if not dpg.is_mouse_button_down(0):
                 self._end_crop_drag()
+                self._finish_crop_interaction()
             return
         if not dpg.is_mouse_button_down(0):
             return
@@ -839,8 +877,9 @@ class StencilApp:
         self._compute_display_rect()
         self._update_selection_visual()
         self._last_crop = None
+        self._crop_changed = True
         dpg.set_value("status_text", "Crop reset to centered max square — updating...")
-        self._do_update_preview()
+        self._finish_crop_interaction()
 
     def _render_svg_to_png(self, svg_path, png_path, size=380):
         """Best-effort SVG->PNG for the vector preview pane.
@@ -923,24 +962,35 @@ class StencilApp:
             config = self.get_config()
             preprocess_keys = [
                 "denoise_strength", "blur_radius", "threshold_offset", "invert",
-                "min_area", "block_size", "line_thickness",
+                "min_area", "block_size", "line_width_px",
             ]
             vector_keys = [
                 "detail_level", "corner_threshold", "splice_threshold",
                 "trace_mode", "vector_speckle",
             ]
-            config_changed = self._last_config is None or any(
-                config[k] != self._last_config.get(k, None)
-                for k in preprocess_keys + vector_keys
-            )
-            do_preprocess = (
-                config_changed and (
-                    self._last_config is None
-                    or any(config[k] != self._last_config.get(k, None) for k in preprocess_keys)
-                    or self.crop_rect != getattr(self, "_last_crop", None)
+            crop_changed = self.crop_rect != getattr(self, "_last_crop", None)
+            input_changed = self.process_input != getattr(self, "_last_process_input", None)
+            preprocess_config_changed = (
+                self._last_config is None
+                or any(
+                    config[k] != self._last_config.get(k, None)
+                    for k in preprocess_keys
                 )
             )
-            do_vector = config_changed or do_preprocess
+            vector_config_changed = (
+                self._last_config is None
+                or any(
+                    config[k] != self._last_config.get(k, None)
+                    for k in vector_keys
+                )
+            )
+            do_preprocess = (
+                self._last_binary is None
+                or crop_changed
+                or input_changed
+                or preprocess_config_changed
+            )
+            do_vector = do_preprocess or vector_config_changed
 
             if do_preprocess:
                 proc_in = self.process_input or self.input_path
@@ -968,6 +1018,7 @@ class StencilApp:
                     self._last_binary = processed
 
             self._last_crop = self.crop_rect
+            self._last_process_input = self.process_input
 
             if not do_vector and self.last_svg and os.path.exists(self.svg_temp):
                 pass  # reuse existing SVG
@@ -1116,8 +1167,7 @@ class StencilApp:
             # For the *initial* preview after loading an image we want it right away,
             # not waiting for the debounce timer.
             if self._dirty:
-                self._dirty = False
-                self._do_update_preview()
+                self._flush_preview_update()
 
     def save_vector(self):
         if not self.current_preprocessed or not os.path.exists(self.current_preprocessed):
@@ -1185,18 +1235,16 @@ class StencilApp:
 
     def _on_global_mouse_release(self, sender=None, app_data=None, user_data=None):
         """Force an immediate preview update when the user releases the mouse after dragging a slider.
-        This (together with the idle poller) implements "don't start heavy processing until the user stops moving the slider".
+        Crop drags are flushed from _on_mouse_release_crop (button-0 handler); skip duplicate work here.
         """
         was_dragging_crop = getattr(self, "_is_dragging", False)
-        if getattr(self, "_dirty", False) and self.input_path:
-            self._dirty = False
-            self._do_update_preview()
         if was_dragging_crop or self._is_dragging:
             self._end_crop_drag()
             _verbose_log("[CROP] global release cleared crop drag state", verbose=self.verbose)
-            current = dpg.get_value("status_text") or ""
-            if "Dragging crop" in current:
-                dpg.set_value("status_text", "Crop drag released — applying change...")
+        if getattr(self, "_crop_changed", False):
+            self._finish_crop_interaction()
+        elif getattr(self, "_dirty", False) and self.input_path:
+            self._flush_preview_update()
 
     def _schedule_debounce_check(self):
         """Schedule the next idle debounce poll.
