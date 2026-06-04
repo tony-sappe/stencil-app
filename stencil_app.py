@@ -6,7 +6,7 @@ Brand new implementation per specification.md + prior conversation.
 Core flow:
 - Load image (robust DPG file dialog, PIL + cv2 fallback for HEIC etc.)
 - Preprocess (denoise, blur, adaptive thresh, optional invert, open morph) -> binary for tracing
-- vtracer.convert_image_to_svg_py (binary, live params for detail/min_area/corner)
+- vtracer.convert_image_to_svg_py (binary; preprocess owns speckle cleanup; vector sliders control curve fidelity)
 - 3 live previews via DPG dynamic textures + set_value (orig color, preproc binary, vector raster); uses np arrays + slider debounce to avoid unnecessary work while dragging
 - Realtime slider/checkbox callbacks update everything
 - Export SVG (always) + EPS (if inkscape in PATH)
@@ -16,6 +16,7 @@ Core flow:
 This version uses documented DPG dynamic textures (np arrays, not python lists) + slider debounce (process only after you stop moving or release) + mouse-release force for reliable live previews without unnecessary work while dragging.
 """
 
+import argparse
 import os
 import subprocess
 import tempfile
@@ -29,8 +30,23 @@ import vtracer
 from PIL import Image
 
 
+def _verbose_log(msg: str, *, verbose: bool) -> None:
+    if verbose:
+        print(msg)
+
+
+# vtracer length_threshold: lower = shorter segments = closer to the binary input
+_LENGTH_MIN = 3.5
+_LENGTH_MAX = 10.0
+_DETAIL_MIN = 0.35
+_DETAIL_MAX = 1.0
+
+
 class StencilApp:
-    def __init__(self):
+    TRACE_MODES = ("Smooth (spline)", "Polygon", "Pixel-accurate")
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
         self.input_path = None
         self.current_preprocessed = None
         self.last_svg = None
@@ -46,8 +62,6 @@ class StencilApp:
         self.texture_size = 256   # internal texture res (displayed at preview_size; smaller = less mem/CPU per update)
         self.preview_size = 470  # larger to span full window width evenly as squares (with borders)
 
-        # Throttling to prevent memory blowup from rapid slider drags (vtracer + large texture data churn)
-        self._last_update_ts = 0.0
         self._dirty = False
 
         # Debounce for sliders: don't start heavy processing (preprocess + vtracer) until
@@ -113,7 +127,7 @@ class StencilApp:
                     default_value=checker,
                     tag=ttag,
                 )
-            print("[INFO] Dynamic texture registry + 3 checker placeholders created.")
+            _verbose_log("[INFO] Dynamic texture registry + 3 checker placeholders created.", verbose=self.verbose)
 
         dpg.create_viewport(
             title="Phone Photo → Screen Print Vector",
@@ -122,7 +136,7 @@ class StencilApp:
             resizable=True,
         )
         dpg.setup_dearpygui()
-        print("[INFO] Viewport + DPG setup done.")
+        _verbose_log("[INFO] Viewport + DPG setup done.", verbose=self.verbose)
 
         with dpg.window(tag="main_win"):
             with dpg.group(horizontal=True):
@@ -133,10 +147,7 @@ class StencilApp:
 
             dpg.add_separator()
 
-            with dpg.collapsing_header(
-                label="Preprocessing settings (affect binary image for tracing — Min Area now also pre-filters specks)",
-                default_open=True,
-            ):
+            with dpg.collapsing_header(label="Preprocessing settings", default_open=True):
                 dpg.add_slider_int(
                     label="Denoise Strength",
                     tag="slider_denoise",
@@ -198,21 +209,36 @@ class StencilApp:
                     callback=self.update_preview,
                 )
 
-            with dpg.collapsing_header(
-                label="Vector settings (only affect final paths — reuse preprocessed binary for faster updates)",
-                default_open=True,
-            ):
+            with dpg.collapsing_header(label="Vector settings", default_open=True):
+                dpg.add_text(
+                    "The center preview is the exact binary image sent to the tracer. "
+                    "The right preview is simplified curves — use Match preprocessed or raise Path fidelity.",
+                    color=(160, 180, 200),
+                )
+                dpg.add_button(
+                    label="Match preprocessed preview",
+                    callback=self._apply_match_preprocess_preset,
+                    width=220,
+                )
+                dpg.add_combo(
+                    label="Trace mode",
+                    tag="combo_trace_mode",
+                    items=list(self.TRACE_MODES),
+                    default_value="Polygon",
+                    callback=self.update_preview,
+                    width=220,
+                )
                 dpg.add_slider_float(
-                    label="Detail Level",
+                    label="Path fidelity",
                     tag="slider_detail",
-                    default_value=0.95,
-                    min_value=0.35,
-                    max_value=1.0,
+                    default_value=1.0,
+                    min_value=_DETAIL_MIN,
+                    max_value=_DETAIL_MAX,
                     callback=self.update_preview,
                     width=380,
                 )
                 dpg.add_slider_int(
-                    label="Corner Threshold",
+                    label="Corner threshold (deg)",
                     tag="slider_corner",
                     default_value=30,
                     min_value=0,
@@ -221,7 +247,7 @@ class StencilApp:
                     width=380,
                 )
                 dpg.add_slider_int(
-                    label="Splice Threshold",
+                    label="Splice threshold (deg)",
                     tag="slider_splice_threshold",
                     default_value=45,
                     min_value=0,
@@ -229,13 +255,21 @@ class StencilApp:
                     callback=self.update_preview,
                     width=380,
                 )
+                dpg.add_slider_int(
+                    label="Extra vector speckle filter (px)",
+                    tag="slider_vector_speckle",
+                    default_value=0,
+                    min_value=0,
+                    max_value=80,
+                    callback=self.update_preview,
+                    width=380,
+                )
 
             dpg.add_separator()
 
             dpg.add_text(
-                "Preview boxes below show checkerboard at launch (proves texture system). "
-                "Load an image — previews update after you stop moving a slider (debounced) or release the mouse. ⏳ shows while processing. "
-                "If input isn't square, drag the yellow square overlay on Original to pick the exact region (final output is always square).",
+                "Load an image — previews update when you stop moving a slider or release the mouse. "
+                "⏳ shows while processing. Drag the yellow square on Original to crop (output is always square).",
                 color=(200, 200, 140),
             )
 
@@ -258,7 +292,7 @@ class StencilApp:
                         pass
 
                 with dpg.group():
-                    dpg.add_text("Vector Result (live)", color=(140, 220, 140))
+                    dpg.add_text("Vector (traced from center, binarized preview)", color=(140, 220, 140))
                     with dpg.child_window(
                         tag="col_vec", border=True,
                         width=self.preview_size + 2, height=self.preview_size + 2
@@ -314,17 +348,19 @@ class StencilApp:
             # button is held (per is_mouse_button_down) and we are not yet dragging,
             # we can latch onto the crop rect if the cursor is over it.
             dpg.add_mouse_move_handler(callback=self._on_mouse_move)
-        print("[CROP] mouse handlers (down/drag/release + move fallback) registered (global handler_registry)")
+        _verbose_log(
+            "[CROP] mouse handlers (down/drag/release + move fallback) registered",
+            verbose=self.verbose,
+        )
 
         dpg.set_primary_window("main_win", True)
         dpg.set_exit_callback(self._on_exit)
         dpg.show_viewport()
-        print("[INFO] Viewport shown.")
+        _verbose_log("[INFO] Viewport shown.", verbose=self.verbose)
 
         # Schedule adding the (texture-bound) image widgets once DPG is fully up.
-        # Using frame callback avoids early binding issues seen in prior attempts.
         def _initial_add_preview_images(sender, app_data, user_data):
-            print("[INFO] Adding initial preview images (bound to dynamic checker textures)...")
+            _verbose_log("[INFO] Adding initial preview images...", verbose=self.verbose)
             for col_tag, img_tag, tex_tag in [
                 ("col_orig", "img_orig", "orig_texture"),
                 ("col_proc", "img_proc", "proc_texture"),
@@ -342,10 +378,10 @@ class StencilApp:
                     height=self.preview_size,
                     parent=col_tag,
                 )
-            print("[INFO] Initial preview images added. Checkerboards should be visible in the three bordered boxes.")
+            _verbose_log("[INFO] Initial preview images added.", verbose=self.verbose)
 
         dpg.set_frame_callback(2, _initial_add_preview_images)
-        print("[INFO] Initial preview image add scheduled for frame 2.")
+        _verbose_log("[INFO] Initial preview image add scheduled for frame 2.", verbose=self.verbose)
 
         # Start the debounce/idle poller that will trigger processing after the user stops
         # moving a slider for _debounce_delay seconds.
@@ -362,8 +398,53 @@ class StencilApp:
             "line_thickness": dpg.get_value("slider_line_thickness"),
             "corner_threshold": dpg.get_value("slider_corner"),
             "splice_threshold": dpg.get_value("slider_splice_threshold"),
+            "trace_mode": dpg.get_value("combo_trace_mode"),
+            "vector_speckle": dpg.get_value("slider_vector_speckle"),
             "invert": dpg.get_value("check_invert"),
         }
+
+    def _length_threshold_from_detail(self, detail_level: float) -> float:
+        """Map UI fidelity (high = match binary) to vtracer length_threshold (low = more segments)."""
+        span = _DETAIL_MAX - _DETAIL_MIN
+        if span <= 0:
+            return _LENGTH_MIN
+        t = (_DETAIL_MAX - detail_level) / span
+        return _LENGTH_MIN + t * (_LENGTH_MAX - _LENGTH_MIN)
+
+    def _trace_mode_to_vtracer(self, label: str) -> str:
+        return {
+            "Smooth (spline)": "spline",
+            "Polygon": "polygon",
+            "Pixel-accurate": "none",
+        }.get(label, "polygon")
+
+    def _vtracer_kwargs(self, config: dict) -> dict:
+        """Build vtracer args. Preprocess already applies Min Area; default vector speckle is 0."""
+        return {
+            "colormode": "binary",
+            "filter_speckle": int(config.get("vector_speckle", 0)),
+            "mode": self._trace_mode_to_vtracer(config.get("trace_mode", "Polygon")),
+            "corner_threshold": int(config["corner_threshold"]),
+            "length_threshold": self._length_threshold_from_detail(float(config["detail_level"])),
+            "splice_threshold": int(config.get("splice_threshold", 45)),
+            "max_iterations": 10,
+            "path_precision": 8,
+        }
+
+    def _apply_match_preprocess_preset(self, sender=None, app_data=None, user_data=None):
+        """Tune vector tracing to stay closest to the center binary preview."""
+        dpg.set_value("slider_detail", _DETAIL_MAX)
+        dpg.set_value("slider_corner", 0)
+        dpg.set_value("slider_splice_threshold", 180)
+        dpg.set_value("combo_trace_mode", "Pixel-accurate")
+        dpg.set_value("slider_vector_speckle", 0)
+        dpg.set_value("status_text", "Vector preset: match preprocessed — release slider or wait for update")
+        self.update_preview()
+
+    def _binarize_preview_pil(self, pil_img: Image.Image) -> Image.Image:
+        """Re-threshold rasterized SVG preview so it compares fairly to the binary center pane."""
+        arr = np.array(pil_img.convert("L"), dtype=np.uint8)
+        return Image.fromarray(np.where(arr < 128, 0, 255).astype(np.uint8))
 
     def preprocess(self, img_path, config):
         """PIL-first load (broad formats incl. HEIC if pillow-heif installed) then cv2 binary prep."""
@@ -482,7 +563,7 @@ class StencilApp:
             if dpg.does_item_exist(self._sel_rect_tag):
                 try:
                     dpg.delete_item(self._sel_rect_tag)
-                except:
+                except Exception:
                     pass
             dpg.set_value("crop_info_text", "")
             return
@@ -521,7 +602,7 @@ class StencilApp:
         for ch in dpg.get_item_children(self._orig_drawlist_tag, 1) or []:
             try:
                 dpg.delete_item(ch)
-            except:
+            except Exception:
                 pass
         ps = self.preview_size
         # bg: the full image view (via the orig_texture which is updated from full_pil)
@@ -573,11 +654,17 @@ class StencilApp:
             self._is_dragging = True
             self._drag_start_rect = (cx, cy, cs)
             self._drag_start_mouse = (ix, iy)
-            dpg.set_value("status_text", "✥ Dragging crop (move/resize yellow square) — release mouse to update previews")
+            dpg.set_value("status_text", "Dragging crop — release mouse to update previews")
             if hit_corner is not None:
-                print(f"[CROP] drag START corner={hit_corner} at img=({ix:.1f},{iy:.1f}) handle_px={handle:.1f}")
+                _verbose_log(
+                    f"[CROP] drag START corner={hit_corner} at img=({ix:.1f},{iy:.1f}) handle_px={handle:.1f}",
+                    verbose=self.verbose,
+                )
             else:
-                print(f"[CROP] drag START move inside at img=({ix:.1f},{iy:.1f}) crop=({cx},{cy},{cs})")
+                _verbose_log(
+                    f"[CROP] drag START move at img=({ix:.1f},{iy:.1f}) crop=({cx},{cy},{cs})",
+                    verbose=self.verbose,
+                )
             return True
         return False
 
@@ -591,7 +678,7 @@ class StencilApp:
         # Clear any temporary drag status message if present
         try:
             current = dpg.get_value("status_text") or ""
-            if "Dragging crop" in current or "✥" in current:
+            if "Dragging crop" in current:
                 dpg.set_value("status_text", "")
         except Exception:
             pass
@@ -605,50 +692,55 @@ class StencilApp:
         else:
             button = app_data
 
-        if button != 0:  # left button only
-            # Only log the ignore for non-left to avoid too much spam, but show raw for debug
-            if not isinstance(app_data, (list, tuple)) or app_data[0] != 0:
-                print(f"[CROP] MOUSE_DOWN ignored non-left: raw_app_data={app_data}")
+        if button != 0:
             return
 
         if not dpg.does_item_exist(self._orig_drawlist_tag):
-            print("[CROP]   -> drawlist item does not exist!")
+            _verbose_log("[CROP] drawlist item does not exist", verbose=self.verbose)
             return
         if not self.full_pil or not self.crop_rect:
-            print(f"[CROP]   -> no image loaded yet (full_pil={self.full_pil is not None}, crop_rect={self.crop_rect})")
+            _verbose_log(
+                f"[CROP] no image loaded (full_pil={self.full_pil is not None}, crop_rect={self.crop_rect})",
+                verbose=self.verbose,
+            )
             return
         if self._orig_scale <= 0:
             self._compute_display_rect()
         mpos = dpg.get_mouse_pos(local=False)
-        print(f"[CROP] MOUSE_DOWN left: raw_app_data={app_data}, mouse_global={mpos}")
-        # To avoid spamming on clicks elsewhere, only evaluate the crop hit test for
-        # mouse positions that could plausibly be over the left Original preview column.
-        if mpos[0] > 550:
+        _verbose_log(f"[CROP] MOUSE_DOWN left: app_data={app_data}, mouse={mpos}", verbose=self.verbose)
+        if mpos[0] > self._orig_preview_x_max():
             return
         if self._try_begin_crop_drag(mpos):
             return
-        # If we got here, the click was over the left preview area but did not hit the
-        # current yellow crop rect or its handles.
-        # Re-compute local coords just for a helpful diagnostic message.
         rmin = dpg.get_item_rect_min(self._orig_drawlist_tag)
         lx = mpos[0] - rmin[0]
         ly = mpos[1] - rmin[1]
         if not self._point_in_img_rect(lx, ly):
-            print(f"[CROP] down: over drawlist but outside photo content area (lx={lx:.1f}, ly={ly:.1f})")
+            _verbose_log(
+                f"[CROP] down outside photo (lx={lx:.1f}, ly={ly:.1f})",
+                verbose=self.verbose,
+            )
         else:
             ix, iy = self._display_to_image(lx, ly)
             cx, cy, cs = self.crop_rect
-            print(f"[CROP] down: over photo but outside current crop rect (ix={ix:.1f},iy={iy:.1f}) crop=({cx},{cy},{cs})")
+            _verbose_log(
+                f"[CROP] down outside crop rect (ix={ix:.1f},iy={iy:.1f}) crop=({cx},{cy},{cs})",
+                verbose=self.verbose,
+            )
+
+    def _orig_preview_x_max(self) -> float:
+        """Right edge of the Original preview column in global screen coords."""
+        if dpg.does_item_exist(self._orig_drawlist_tag):
+            try:
+                return float(dpg.get_item_rect_max(self._orig_drawlist_tag)[0]) + 8
+            except Exception:
+                pass
+        return float(self.preview_size + 24)
 
     def _on_mouse_drag(self, sender, app_data, user_data):
-        # Extra safety for devices (trackpads) where release events or button state
-        # can be delayed or reported oddly: if we think we're dragging but the button
-        # is no longer down, force end the drag immediately. Do this before logging.
         if self._is_dragging and not dpg.is_mouse_button_down(0):
             self._end_crop_drag()
             return
-        if self._is_dragging:
-            print(f"[CROP] DRAG handler (while crop active), app_data={app_data}")
         if not self._is_dragging or not self.crop_rect or not self.full_pil:
             return
         if self._drag_start_mouse is None or self._drag_start_rect is None:
@@ -700,15 +792,10 @@ class StencilApp:
         self._update_selection_visual()
         self._last_slider_change = time.time()
         self._dirty = True
-        # Occasional console feedback so user can see drag is alive even if visual is subtle
-        self._drag_dbg = getattr(self, "_drag_dbg", 0) + 1
-        if self._drag_dbg % 8 == 0:
-            print(f"[CROP] drag live -> {self.crop_rect} (mouse local lx={lx:.0f} ly={ly:.0f})")
 
     def _on_mouse_release_crop(self, sender, app_data, user_data):
         if self._is_dragging:
-            print(f"[CROP] RELEASE while crop drag active (app_data={app_data})")
-            print("[CROP] mouse release while dragging crop")
+            _verbose_log(f"[CROP] RELEASE (app_data={app_data})", verbose=self.verbose)
             self._end_crop_drag()
             current = dpg.get_value("status_text") or ""
             if "Dragging crop" in current:
@@ -735,10 +822,10 @@ class StencilApp:
             return
         mpos = dpg.get_mouse_pos(local=False)
         # Only consider positions that could be over the left preview to avoid work/spam
-        if mpos[0] > 550:
+        if mpos[0] > self._orig_preview_x_max():
             return
         if self._try_begin_crop_drag(mpos):
-            print("[CROP] drag latched via mouse_move + is_mouse_button_down(0) fallback")
+            _verbose_log("[CROP] drag latched via mouse_move fallback", verbose=self.verbose)
 
     def _reset_crop(self, sender=None, app_data=None, user_data=None):
         """Reset crop to the largest centered square (full width or height)."""
@@ -828,18 +915,32 @@ class StencilApp:
     def _do_update_preview(self):
         """Heavy work: preprocess + vtracer + render to texture data.
         Triggered only after debounce (user stopped moving slider) or mouse release.
-        Skips full preprocess if only 'vector-only' settings (detail, corner) changed.
+        Skips preprocess when only vector settings change; re-traces from the same binary PNG.
         """
         dpg.set_value("loading_indicator", "⏳ Processing...")
-        dpg.set_value("status_text", "Processing ⏳ ... (may lag on complex images)")
+        dpg.set_value("status_text", "Processing…")
         try:
             config = self.get_config()
-            preprocess_keys = ["denoise_strength", "blur_radius", "threshold_offset", "invert", "min_area", "block_size", "line_thickness"]
-            do_preprocess = (
-                self._last_config is None or
-                any(config[k] != self._last_config.get(k, None) for k in preprocess_keys) or
-                self.crop_rect != getattr(self, "_last_crop", None)
+            preprocess_keys = [
+                "denoise_strength", "blur_radius", "threshold_offset", "invert",
+                "min_area", "block_size", "line_thickness",
+            ]
+            vector_keys = [
+                "detail_level", "corner_threshold", "splice_threshold",
+                "trace_mode", "vector_speckle",
+            ]
+            config_changed = self._last_config is None or any(
+                config[k] != self._last_config.get(k, None)
+                for k in preprocess_keys + vector_keys
             )
+            do_preprocess = (
+                config_changed and (
+                    self._last_config is None
+                    or any(config[k] != self._last_config.get(k, None) for k in preprocess_keys)
+                    or self.crop_rect != getattr(self, "_last_crop", None)
+                )
+            )
+            do_vector = config_changed or do_preprocess
 
             if do_preprocess:
                 proc_in = self.process_input or self.input_path
@@ -868,46 +969,45 @@ class StencilApp:
 
             self._last_crop = self.crop_rect
 
-            # Vector step — the params that must affect the live right-hand pane.
-            # Wrapped to catch visioncortex "overflow" (too many clusters from speckly binary on high-res images).
-            try:
-                vtracer.convert_image_to_svg_py(
-                    self.preproc_temp,
-                    self.svg_temp,
-                    colormode="binary",
-                    filter_speckle=config["min_area"],
-                    corner_threshold=config["corner_threshold"],
-                    length_threshold=max(3.5, min(10.0, config["detail_level"] * 10)),
-                    splice_threshold=config.get("splice_threshold", 45),
-                    max_iterations=10,
-                )
-            except Exception as ve:
-                # The Rust panic prints to stderr before this; we turn it into a nice status.
-                dpg.set_value(
-                    "status_text",
-                    f"Vectorize failed (overflow or bad params): {ve}. "
-                    "Try ↑ Min Area (speckle), ↑ Denoise, or adjust Threshold. Preview not updated."
-                )
-                dpg.set_value("loading_indicator", "")
-                return  # keep previous textures / last good state
-            self.last_svg = self.svg_temp
+            if not do_vector and self.last_svg and os.path.exists(self.svg_temp):
+                pass  # reuse existing SVG
+            else:
+                try:
+                    vtracer.convert_image_to_svg_py(
+                        self.preproc_temp,
+                        self.svg_temp,
+                        **self._vtracer_kwargs(config),
+                    )
+                except Exception as ve:
+                    dpg.set_value(
+                        "status_text",
+                        f"Vectorize failed (overflow or bad params): {ve}. "
+                        "Try ↑ Min Area (speckle), ↑ Denoise, or adjust Threshold. Preview not updated.",
+                    )
+                    dpg.set_value("loading_indicator", "")
+                    return
+                self.last_svg = self.svg_temp
 
             orig_pil = self.full_pil if self.full_pil is not None else (self._orig_pil if self._orig_pil is not None else Image.open(self.input_path))
 
             vec_pil = None
             render_size = self.texture_size  # render smaller for mem, we resample to tex anyway
-            if self._render_svg_to_png(self.svg_temp, self.vec_preview_temp, size=render_size):
+            if self.last_svg and self._render_svg_to_png(self.svg_temp, self.vec_preview_temp, size=render_size):
                 if os.path.exists(self.vec_preview_temp):
-                    vec_pil = Image.open(self.vec_preview_temp)
+                    vec_pil = self._binarize_preview_pil(Image.open(self.vec_preview_temp))
 
             if vec_pil is None:
                 dpg.set_value(
                     "status_text",
-                    "Live preview (vector raster used fallback — install inkscape for best vector preview)"
+                    "Vector preview: showing preprocessed binary (install inkscape for SVG raster preview)"
                 )
                 vec_pil = Image.fromarray(processed).convert("L")
             else:
-                dpg.set_value("status_text", "Live vector preview updated.")
+                lt = self._length_threshold_from_detail(config["detail_level"])
+                dpg.set_value(
+                    "status_text",
+                    f"Vector preview updated ({config['trace_mode']}, path fidelity → length {lt:.1f}).",
+                )
 
             # Push fresh pixel data into the (already-bound) dynamic textures.
             # Now using compact np arrays (no .tolist()), so far lower per-update RAM.
@@ -1006,7 +1106,7 @@ class StencilApp:
                 if dpg.does_item_exist(self._sel_rect_tag):
                     try:
                         dpg.delete_item(self._sel_rect_tag)
-                    except:
+                    except Exception:
                         pass
                 dpg.set_value("crop_info_text", "")
 
@@ -1017,7 +1117,6 @@ class StencilApp:
             # not waiting for the debounce timer.
             if self._dirty:
                 self._dirty = False
-                self._last_update_ts = time.time()
                 self._do_update_preview()
 
     def save_vector(self):
@@ -1041,12 +1140,7 @@ class StencilApp:
             vtracer.convert_image_to_svg_py(
                 self.current_preprocessed,
                 save_path,
-                colormode="binary",
-                filter_speckle=config["min_area"],
-                corner_threshold=config["corner_threshold"],
-                length_threshold=max(3.5, min(10.0, config["detail_level"] * 10)),
-                splice_threshold=config.get("splice_threshold", 45),
-                max_iterations=10,
+                **self._vtracer_kwargs(config),
             )
         except Exception as e:
             dpg.set_value("status_text", f"Vectorize failed: {e}")
@@ -1096,11 +1190,10 @@ class StencilApp:
         was_dragging_crop = getattr(self, "_is_dragging", False)
         if getattr(self, "_dirty", False) and self.input_path:
             self._dirty = False
-            self._last_update_ts = time.time()
             self._do_update_preview()
         if was_dragging_crop or self._is_dragging:
             self._end_crop_drag()
-            print("[CROP] global release cleared crop drag state")
+            _verbose_log("[CROP] global release cleared crop drag state", verbose=self.verbose)
             current = dpg.get_value("status_text") or ""
             if "Dragging crop" in current:
                 dpg.set_value("status_text", "Crop drag released — applying change...")
@@ -1125,7 +1218,6 @@ class StencilApp:
         if getattr(self, "_dirty", False) and self.input_path:
             if time.time() - self._last_slider_change >= self._debounce_delay:
                 self._dirty = False
-                self._last_update_ts = time.time()
                 self._do_update_preview()
         # Keep the poller alive
         self._schedule_debounce_check()
@@ -1152,5 +1244,12 @@ class StencilApp:
 
 
 if __name__ == "__main__":
-    app = StencilApp()
+    parser = argparse.ArgumentParser(description="Phone photo → screen print vector (Dear PyGui)")
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print startup and crop-handler diagnostics to the console",
+    )
+    args = parser.parse_args()
+    app = StencilApp(verbose=args.verbose)
     app.run()
