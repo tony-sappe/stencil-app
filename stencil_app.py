@@ -73,6 +73,7 @@ class StencilApp:
         self._resize_corner = None  # 0=tl,1=tr,2=br,3=bl or -1=move
         self._drag_start_rect = None
         self._drag_start_mouse = None
+        self._last_drag_end_ts = 0.0
 
         self._build_ui()
 
@@ -128,6 +129,7 @@ class StencilApp:
                 dpg.add_button(label="Load Photo", callback=self.load_image, width=110)
                 dpg.add_button(label="Save Vector", callback=self.save_vector, width=110)
                 dpg.add_button(label="Open SVG", callback=self.open_svg, width=110)
+                dpg.add_button(label="Reset Crop", callback=self._reset_crop, width=95)
 
             dpg.add_separator()
 
@@ -232,14 +234,15 @@ class StencilApp:
 
             dpg.add_text(
                 "Preview boxes below show checkerboard at launch (proves texture system). "
-                "Load an image — previews update after you stop moving a slider (debounced) or release the mouse. ⏳ shows while processing.",
+                "Load an image — previews update after you stop moving a slider (debounced) or release the mouse. ⏳ shows while processing. "
+                "If input isn't square, drag the yellow square overlay on Original to pick the exact region (final output is always square).",
                 color=(200, 200, 140),
             )
 
             # Labels above bordered preview boxes (images fill the boxes exactly)
             with dpg.group(horizontal=True):
                 with dpg.group():
-                    dpg.add_text("Original")
+                    dpg.add_text("Original (drag yellow square to crop)")
                     with dpg.child_window(
                         tag="col_orig", border=True,
                         width=self.preview_size + 2, height=self.preview_size + 2
@@ -263,6 +266,7 @@ class StencilApp:
                         pass
 
             dpg.add_spacer(height=4)
+            dpg.add_text(tag="crop_info_text", default_value="")
             dpg.add_text(tag="status_text", default_value="Load a photo to begin. Changes to sliders/checkbox update the vector preview live.")
             dpg.add_text(tag="loading_indicator", default_value="", color=(255, 180, 100))
 
@@ -295,15 +299,22 @@ class StencilApp:
             dpg.add_file_extension(".svg", color=(100, 180, 255, 255))
             dpg.add_file_extension(".*")
 
-        # Global mouse release handler: forces an immediate preview update after the user stops
-        # dragging a slider (one of the two triggers for debounced processing).
+        # Handler registry for global mouse events.
+        # We put both the slider debounce release *and* the crop drag handlers here.
+        # (mouse_*_down/drag/release are only compatible with normal handler_registry,
+        # not item_handler_registry. The crop callbacks use manual rect/hit tests
+        # + the drawlist's screen bounds to decide if a click applies to the overlay.)
         with dpg.handler_registry(tag="global_mouse_handlers"):
             dpg.add_mouse_release_handler(callback=self._on_global_mouse_release)
-
-        # Additional for crop drag on original preview
-        dpg.add_mouse_down_handler(callback=self._on_mouse_down)
-        dpg.add_mouse_drag_handler(callback=self._on_mouse_drag)
-        dpg.add_mouse_release_handler(callback=self._on_mouse_release_crop)
+            dpg.add_mouse_down_handler(button=0, callback=self._on_mouse_down)
+            dpg.add_mouse_drag_handler(button=0, callback=self._on_mouse_drag)
+            dpg.add_mouse_release_handler(button=0, callback=self._on_mouse_release_crop)
+            # Fallback move handler: helps with trackpads / devices where "mouse down"
+            # events report button in odd ways (e.g. [0, delta] or repeated). While left
+            # button is held (per is_mouse_button_down) and we are not yet dragging,
+            # we can latch onto the crop rect if the cursor is over it.
+            dpg.add_mouse_move_handler(callback=self._on_mouse_move)
+        print("[CROP] mouse handlers (down/drag/release + move fallback) registered (global handler_registry)")
 
         dpg.set_primary_window("main_win", True)
         dpg.set_exit_callback(self._on_exit)
@@ -473,6 +484,7 @@ class StencilApp:
                     dpg.delete_item(self._sel_rect_tag)
                 except:
                     pass
+            dpg.set_value("crop_info_text", "")
             return
         if not hasattr(self, "_orig_scale") or self._orig_scale <= 0:
             self._compute_display_rect()
@@ -489,7 +501,7 @@ class StencilApp:
         if dpg.does_item_exist(self._sel_rect_tag):
             dpg.configure_item(self._sel_rect_tag, pmin=pmin, pmax=pmax)
         else:
-            dpg.draw_rect(
+            dpg.draw_rectangle(
                 pmin=pmin,
                 pmax=pmax,
                 color=(255, 255, 0, 255),
@@ -498,6 +510,9 @@ class StencilApp:
                 parent=self._orig_drawlist_tag,
                 tag=self._sel_rect_tag
             )
+        # live crop size info (updates during drag too)
+        pw, ph = self.full_pil.size
+        dpg.set_value("crop_info_text", f"Crop region: {s}×{s} px  (from original {pw}×{ph})")
 
     def _setup_orig_drawlist(self):
         if not dpg.does_item_exist(self._orig_drawlist_tag):
@@ -521,55 +536,126 @@ class StencilApp:
         if self.crop_rect and self.full_pil:
             self._update_selection_visual()
 
-    def _on_mouse_down(self, sender, app_data, user_data):
-        # app_data is the button for down handler
-        if app_data != 0:  # left button only
-            return
-        if not dpg.does_item_exist(self._orig_drawlist_tag):
-            return
-        if not dpg.is_item_hovered(self._orig_drawlist_tag):
-            return
-        if not self.full_pil or not self.crop_rect:
-            return
-        if self._orig_scale <= 0:
-            self._compute_display_rect()
-        mpos = dpg.get_mouse_pos(local=False)
+    def _try_begin_crop_drag(self, mpos):
+        """Shared logic to test if a mouse position (global) is over the photo content
+        and over the current crop rect (or its handles). If so, set drag state and return True.
+        Used by both the down handler and the move fallback (for trackpad compatibility).
+        """
+        if not dpg.does_item_exist(self._orig_drawlist_tag) or not self.full_pil or not self.crop_rect:
+            return False
         rmin = dpg.get_item_rect_min(self._orig_drawlist_tag)
+        try:
+            rmax = dpg.get_item_rect_max(self._orig_drawlist_tag)
+        except Exception:
+            ps = self.preview_size
+            rmax = [rmin[0] + ps, rmin[1] + ps]
+        margin = 3
+        if not (rmin[0] - margin <= mpos[0] <= rmax[0] + margin and
+                rmin[1] - margin <= mpos[1] <= rmax[1] + margin):
+            return False
         lx = mpos[0] - rmin[0]
         ly = mpos[1] - rmin[1]
         if not self._point_in_img_rect(lx, ly):
-            return
+            return False
         ix, iy = self._display_to_image(lx, ly)
         cx, cy, cs = self.crop_rect
         handle = 10.0 / self._orig_scale if self._orig_scale > 0 else 10.0
         corners = [(0, 0), (cs, 0), (cs, cs), (0, cs)]
+        hit_corner = None
         for ci in range(4):
             ccx = cx + corners[ci][0]
             ccy = cy + corners[ci][1]
             if abs(ix - ccx) <= handle and abs(iy - ccy) <= handle:
-                self._resize_corner = ci
-                self._is_dragging = True
-                self._drag_start_rect = (cx, cy, cs)
-                self._drag_start_mouse = (ix, iy)
-                return
-        # move if inside
-        if cx <= ix <= cx + cs and cy <= iy <= cy + cs:
-            self._resize_corner = -1
+                hit_corner = ci
+                break
+        if hit_corner is not None or (cx <= ix <= cx + cs and cy <= iy <= cy + cs):
+            self._resize_corner = hit_corner if hit_corner is not None else -1
             self._is_dragging = True
             self._drag_start_rect = (cx, cy, cs)
             self._drag_start_mouse = (ix, iy)
+            dpg.set_value("status_text", "✥ Dragging crop (move/resize yellow square) — release mouse to update previews")
+            if hit_corner is not None:
+                print(f"[CROP] drag START corner={hit_corner} at img=({ix:.1f},{iy:.1f}) handle_px={handle:.1f}")
+            else:
+                print(f"[CROP] drag START move inside at img=({ix:.1f},{iy:.1f}) crop=({cx},{cy},{cs})")
+            return True
+        return False
+
+    def _end_crop_drag(self):
+        """Clear all crop drag state. Call on release or when button is no longer down."""
+        self._is_dragging = False
+        self._resize_corner = None
+        self._drag_start_rect = None
+        self._drag_start_mouse = None
+        self._last_drag_end_ts = time.time()
+        # Clear any temporary drag status message if present
+        try:
+            current = dpg.get_value("status_text") or ""
+            if "Dragging crop" in current or "✥" in current:
+                dpg.set_value("status_text", "")
+        except Exception:
+            pass
+
+    def _on_mouse_down(self, sender, app_data, user_data):
+        # Robust button extraction.
+        # On some systems (esp. macOS trackpad), app_data for mouse_down_handler can be
+        # an int or a list/tuple like [button, delta_or_pressure].
+        if isinstance(app_data, (list, tuple)) and len(app_data) > 0:
+            button = app_data[0]
+        else:
+            button = app_data
+
+        if button != 0:  # left button only
+            # Only log the ignore for non-left to avoid too much spam, but show raw for debug
+            if not isinstance(app_data, (list, tuple)) or app_data[0] != 0:
+                print(f"[CROP] MOUSE_DOWN ignored non-left: raw_app_data={app_data}")
             return
 
+        if not dpg.does_item_exist(self._orig_drawlist_tag):
+            print("[CROP]   -> drawlist item does not exist!")
+            return
+        if not self.full_pil or not self.crop_rect:
+            print(f"[CROP]   -> no image loaded yet (full_pil={self.full_pil is not None}, crop_rect={self.crop_rect})")
+            return
+        if self._orig_scale <= 0:
+            self._compute_display_rect()
+        mpos = dpg.get_mouse_pos(local=False)
+        print(f"[CROP] MOUSE_DOWN left: raw_app_data={app_data}, mouse_global={mpos}")
+        # To avoid spamming on clicks elsewhere, only evaluate the crop hit test for
+        # mouse positions that could plausibly be over the left Original preview column.
+        if mpos[0] > 550:
+            return
+        if self._try_begin_crop_drag(mpos):
+            return
+        # If we got here, the click was over the left preview area but did not hit the
+        # current yellow crop rect or its handles.
+        # Re-compute local coords just for a helpful diagnostic message.
+        rmin = dpg.get_item_rect_min(self._orig_drawlist_tag)
+        lx = mpos[0] - rmin[0]
+        ly = mpos[1] - rmin[1]
+        if not self._point_in_img_rect(lx, ly):
+            print(f"[CROP] down: over drawlist but outside photo content area (lx={lx:.1f}, ly={ly:.1f})")
+        else:
+            ix, iy = self._display_to_image(lx, ly)
+            cx, cy, cs = self.crop_rect
+            print(f"[CROP] down: over photo but outside current crop rect (ix={ix:.1f},iy={iy:.1f}) crop=({cx},{cy},{cs})")
+
     def _on_mouse_drag(self, sender, app_data, user_data):
+        # Extra safety for devices (trackpads) where release events or button state
+        # can be delayed or reported oddly: if we think we're dragging but the button
+        # is no longer down, force end the drag immediately. Do this before logging.
+        if self._is_dragging and not dpg.is_mouse_button_down(0):
+            self._end_crop_drag()
+            return
+        if self._is_dragging:
+            print(f"[CROP] DRAG handler (while crop active), app_data={app_data}")
         if not self._is_dragging or not self.crop_rect or not self.full_pil:
             return
         if self._drag_start_mouse is None or self._drag_start_rect is None:
-            self._is_dragging = False
-            self._resize_corner = None
+            self._end_crop_drag()
             return
         if not dpg.does_item_exist(self._orig_drawlist_tag):
-            self._is_dragging = False
-            self._resize_corner = None
+            self._end_crop_drag()
             return
         mpos = dpg.get_mouse_pos(local=False)
         rmin = dpg.get_item_rect_min(self._orig_drawlist_tag)
@@ -614,12 +700,60 @@ class StencilApp:
         self._update_selection_visual()
         self._last_slider_change = time.time()
         self._dirty = True
+        # Occasional console feedback so user can see drag is alive even if visual is subtle
+        self._drag_dbg = getattr(self, "_drag_dbg", 0) + 1
+        if self._drag_dbg % 8 == 0:
+            print(f"[CROP] drag live -> {self.crop_rect} (mouse local lx={lx:.0f} ly={ly:.0f})")
 
     def _on_mouse_release_crop(self, sender, app_data, user_data):
         if self._is_dragging:
-            self._is_dragging = False
-            self._resize_corner = None
-            # existing global release will force if dirty
+            print(f"[CROP] RELEASE while crop drag active (app_data={app_data})")
+            print("[CROP] mouse release while dragging crop")
+            self._end_crop_drag()
+            current = dpg.get_value("status_text") or ""
+            if "Dragging crop" in current:
+                dpg.set_value("status_text", "Crop drag released — applying change...")
+            # existing global release will force if dirty (which will run _do_update_preview and overwrite status)
+
+    def _on_mouse_move(self, sender, app_data, user_data):
+        """Fallback for starting a crop drag on trackpads / devices where the mouse_down
+        events report button values in non-standard ways (e.g. [0, small_delta] or repeated
+        while "pressed").
+        If the left button is physically down (per is_mouse_button_down) and we are not
+        already in a drag, and the cursor is over the crop rect/handles in the photo area,
+        we latch the drag state here. The normal _on_mouse_drag will then take over.
+        """
+        if self._is_dragging:
+            if not dpg.is_mouse_button_down(0):
+                self._end_crop_drag()
+            return
+        if not dpg.is_mouse_button_down(0):
+            return
+        # Cooldown after a release to prevent the fallback from immediately re-latching
+        # on flaky trackpad button-up reporting (is_mouse_button_down staying True briefly).
+        if time.time() - getattr(self, '_last_drag_end_ts', 0) < 0.15:
+            return
+        mpos = dpg.get_mouse_pos(local=False)
+        # Only consider positions that could be over the left preview to avoid work/spam
+        if mpos[0] > 550:
+            return
+        if self._try_begin_crop_drag(mpos):
+            print("[CROP] drag latched via mouse_move + is_mouse_button_down(0) fallback")
+
+    def _reset_crop(self, sender=None, app_data=None, user_data=None):
+        """Reset crop to the largest centered square (full width or height)."""
+        if not self.full_pil or not self.input_path:
+            return
+        w, h = self.full_pil.size
+        side = min(w, h)
+        self.crop_rect = ((w - side) // 2, (h - side) // 2, side)
+        self._end_crop_drag()
+        self._apply_crop()
+        self._compute_display_rect()
+        self._update_selection_visual()
+        self._last_crop = None
+        dpg.set_value("status_text", "Crop reset to centered max square — updating...")
+        self._do_update_preview()
 
     def _render_svg_to_png(self, svg_path, png_path, size=380):
         """Best-effort SVG->PNG for the vector preview pane.
@@ -853,8 +987,7 @@ class StencilApp:
                 w, h = self.full_pil.size
                 side = min(w, h)
                 self.crop_rect = ((w - side) // 2, (h - side) // 2, side)
-                self._is_dragging = False
-                self._resize_corner = None
+                self._end_crop_drag()
                 self._apply_crop()
                 self._compute_display_rect()
                 self._update_selection_visual()
@@ -869,13 +1002,13 @@ class StencilApp:
                 self._orig_pil = None
                 self.crop_rect = None
                 self.process_input = self.input_path
-                self._is_dragging = False
-                self._resize_corner = None
+                self._end_crop_drag()
                 if dpg.does_item_exist(self._sel_rect_tag):
                     try:
                         dpg.delete_item(self._sel_rect_tag)
                     except:
                         pass
+                dpg.set_value("crop_info_text", "")
 
             dpg.set_value("status_text", f"Loaded: {Path(path).name} — updating previews...")
             self.update_preview()  # marks _dirty + _last_slider_change
@@ -960,12 +1093,17 @@ class StencilApp:
         """Force an immediate preview update when the user releases the mouse after dragging a slider.
         This (together with the idle poller) implements "don't start heavy processing until the user stops moving the slider".
         """
+        was_dragging_crop = getattr(self, "_is_dragging", False)
         if getattr(self, "_dirty", False) and self.input_path:
             self._dirty = False
             self._last_update_ts = time.time()
             self._do_update_preview()
-        self._is_dragging = False
-        self._resize_corner = None
+        if was_dragging_crop or self._is_dragging:
+            self._end_crop_drag()
+            print("[CROP] global release cleared crop drag state")
+            current = dpg.get_value("status_text") or ""
+            if "Dragging crop" in current:
+                dpg.set_value("status_text", "Crop drag released — applying change...")
 
     def _schedule_debounce_check(self):
         """Schedule the next idle debounce poll.
