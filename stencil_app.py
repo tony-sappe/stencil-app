@@ -57,6 +57,7 @@ class StencilApp:
 
         self._last_config = None
         self._last_binary = None
+        self._last_crop = None
 
         # For square crop selection on original
         self.full_pil = None
@@ -318,11 +319,11 @@ class StencilApp:
                 ("col_proc", "img_proc", "proc_texture"),
                 ("col_vec", "img_vec", "vec_texture"),
             ]:
+                if dpg.does_item_exist(img_tag):
+                    dpg.delete_item(img_tag)
                 if col_tag == "col_orig":
                     self._setup_orig_drawlist()
                     continue
-                if dpg.does_item_exist(img_tag):
-                    dpg.delete_item(img_tag)
                 dpg.add_image(
                     tag=img_tag,
                     texture_tag=tex_tag,
@@ -464,8 +465,17 @@ class StencilApp:
         return ix, iy
 
     def _update_selection_visual(self):
-        if not self.crop_rect or not self.full_pil or not dpg.does_item_exist(self._orig_drawlist_tag):
+        if not dpg.does_item_exist(self._orig_drawlist_tag):
             return
+        if not self.crop_rect or not self.full_pil:
+            if dpg.does_item_exist(self._sel_rect_tag):
+                try:
+                    dpg.delete_item(self._sel_rect_tag)
+                except:
+                    pass
+            return
+        if not hasattr(self, "_orig_scale") or self._orig_scale <= 0:
+            self._compute_display_rect()
         ox, oy, dw, dh = self._orig_img_rect
         scale = self._orig_scale
         if scale <= 0:
@@ -521,6 +531,8 @@ class StencilApp:
             return
         if not self.full_pil or not self.crop_rect:
             return
+        if self._orig_scale <= 0:
+            self._compute_display_rect()
         mpos = dpg.get_mouse_pos(local=False)
         rmin = dpg.get_item_rect_min(self._orig_drawlist_tag)
         lx = mpos[0] - rmin[0]
@@ -529,7 +541,6 @@ class StencilApp:
             return
         ix, iy = self._display_to_image(lx, ly)
         cx, cy, cs = self.crop_rect
-        pw, ph = self.full_pil.size
         handle = 10.0 / self._orig_scale if self._orig_scale > 0 else 10.0
         corners = [(0, 0), (cs, 0), (cs, cs), (0, cs)]
         for ci in range(4):
@@ -551,6 +562,14 @@ class StencilApp:
 
     def _on_mouse_drag(self, sender, app_data, user_data):
         if not self._is_dragging or not self.crop_rect or not self.full_pil:
+            return
+        if self._drag_start_mouse is None or self._drag_start_rect is None:
+            self._is_dragging = False
+            self._resize_corner = None
+            return
+        if not dpg.does_item_exist(self._orig_drawlist_tag):
+            self._is_dragging = False
+            self._resize_corner = None
             return
         mpos = dpg.get_mouse_pos(local=False)
         rmin = dpg.get_item_rect_min(self._orig_drawlist_tag)
@@ -587,6 +606,7 @@ class StencilApp:
                 ns = max(5.0, min(ox + os - ix, iy - oy, pw, ph))
                 nx = ox + os - ns
                 ny = oy
+            ns = max(5.0, min(ns, pw - nx, ph - ny))
             nx = max(0.0, min(nx, pw - ns))
             ny = max(0.0, min(ny, ph - ns))
             self.crop_rect = (int(nx), int(ny), int(ns))
@@ -683,11 +703,12 @@ class StencilApp:
             preprocess_keys = ["denoise_strength", "blur_radius", "threshold_offset", "invert", "min_area", "block_size", "line_thickness"]
             do_preprocess = (
                 self._last_config is None or
-                any(config[k] != self._last_config.get(k, None) for k in preprocess_keys)
+                any(config[k] != self._last_config.get(k, None) for k in preprocess_keys) or
+                self.crop_rect != getattr(self, "_last_crop", None)
             )
 
             if do_preprocess:
-                proc_in = getattr(self, "process_input", self.input_path)
+                proc_in = self.process_input or self.input_path
                 processed = self.preprocess(proc_in, config)
                 if processed is None:
                     dpg.set_value("status_text", "Failed to load/process image")
@@ -701,7 +722,7 @@ class StencilApp:
                 processed = self._last_binary
                 if processed is None or not os.path.exists(self.preproc_temp):
                     # fallback
-                    proc_in = getattr(self, "process_input", self.input_path)
+                    proc_in = self.process_input or self.input_path
                     processed = self.preprocess(proc_in, config)
                     if processed is None:
                         dpg.set_value("status_text", "Failed to load/process image")
@@ -710,6 +731,8 @@ class StencilApp:
                     cv2.imwrite(self.preproc_temp, processed)
                     self.current_preprocessed = self.preproc_temp
                     self._last_binary = processed
+
+            self._last_crop = self.crop_rect
 
             # Vector step — the params that must affect the live right-hand pane.
             # Wrapped to catch visioncortex "overflow" (too many clusters from speckly binary on high-res images).
@@ -820,6 +843,8 @@ class StencilApp:
             self._last_config = None
             self._last_binary = None
             self._last_slider_change = 0.0
+            self._last_crop = None
+            self.process_input = self.input_path
 
             # setup crop selection (centered square by default)
             try:
@@ -828,13 +853,29 @@ class StencilApp:
                 w, h = self.full_pil.size
                 side = min(w, h)
                 self.crop_rect = ((w - side) // 2, (h - side) // 2, side)
+                self._is_dragging = False
+                self._resize_corner = None
                 self._apply_crop()
                 self._compute_display_rect()
                 self._update_selection_visual()
+                self._last_crop = self.crop_rect
+
+                # immediately show the full photo + selection box in left pane
+                if self.full_pil:
+                    odata = self._pil_to_texture_data(self.full_pil)
+                    dpg.set_value("orig_texture", odata)
             except Exception:
                 self.full_pil = None
+                self._orig_pil = None
                 self.crop_rect = None
                 self.process_input = self.input_path
+                self._is_dragging = False
+                self._resize_corner = None
+                if dpg.does_item_exist(self._sel_rect_tag):
+                    try:
+                        dpg.delete_item(self._sel_rect_tag)
+                    except:
+                        pass
 
             dpg.set_value("status_text", f"Loaded: {Path(path).name} — updating previews...")
             self.update_preview()  # marks _dirty + _last_slider_change
@@ -923,6 +964,8 @@ class StencilApp:
             self._dirty = False
             self._last_update_ts = time.time()
             self._do_update_preview()
+        self._is_dragging = False
+        self._resize_corner = None
 
     def _schedule_debounce_check(self):
         """Schedule the next idle debounce poll.
