@@ -31,6 +31,21 @@ pip install -r requirements.txt
 
 No extra steps are needed beyond `pip install -r requirements.txt`.
 
+
+### Create the Dock-friendly app with Automator
+
+1. Open Automator → New Document → choose Application.
+2. Drag in Run Shell Script action.
+3. Set Shell to /bin/bash.
+4. Paste: /path/to/your/run_stencil_app.sh
+5. File → Save as... → save as StencilScript.app (in /Applications/ or wherever you like).
+
+**Polish and add to Dock**
+
+1. Right-click the .app → Get Info → drag a custom .icns file onto the icon if you want something nicer than the default.
+2. Drag the .app to your Dock.
+
+
 ## Usage
 
 ### GUI (Recommended)
