@@ -37,7 +37,7 @@ No extra steps are needed beyond `pip install -r requirements.txt`.
 1. Open Automator → New Document → choose Application.
 2. Drag in Run Shell Script action.
 3. Set Shell to /bin/bash.
-4. Paste: /path/to/your/run_stencil_app.sh
+4. Paste the launcher path in quotes, for example `"/Users/you/dev/stencils/run_stencil_app.sh"`. Quotes matter when the path contains spaces.
 5. File → Save as... → save as StencilScript.app (in /Applications/ or wherever you like).
 
 **Polish and add to Dock**
@@ -79,7 +79,7 @@ The GUI shows three panes. They are **not** three versions of the same image typ
 Even with **Preset: max trace fidelity**, the right pane is **not** a pixel copy of the center pane:
 
 1. **Different source** — Center is a raw bitmap; right is **filled SVG paths** drawn by a renderer.
-2. **Rasterization** — Anti-aliased PNG export plus binarization can still thicken strokes slightly (the app uses a high threshold to reduce this).
+2. **Rasterization** — The Inkscape PNG is composited onto white, then mid-gray (luma below 128) becomes ink so faint anti-aliased edges are not solid strokes.
 3. **Thumbnail** — All three panes are letterboxed into ~470 px boxes; use **click to enlarge** for an export-width trace view.
 4. **Tracing** — vtracer builds filled regions, not single-pixel strokes.
 
@@ -94,11 +94,11 @@ Even with **Preset: max trace fidelity**, the right pane is **not** a pixel copy
 | Control | Group | Maps to | Effect | Range |
 |---------|-------|---------|--------|-------|
 | Noise reduction | Preprocess | OpenCV `fastNlMeansDenoising` **`h`** | Stronger denoising before threshold | 0 – 40 |
-| Blur before threshold (σ) | Preprocess | `GaussianBlur` **sigma** (kernel fixed 5×5) | Smoothing before adaptive threshold | 0.0 – 5.0 |
+| Blur before threshold (σ) | Preprocess | `GaussianBlur` **sigma** (kernel fixed 5×5) | Smoothing before adaptive threshold. 0 skips the blur | 0.0 – 5.0 |
 | Threshold bias (C) | Preprocess | `adaptiveThreshold` **`C`** | Higher → lighter image (more white) | -20 – 20 |
 | Local threshold window | Preprocess | `adaptiveThreshold` **`blockSize`** (forced odd ≥ 3) | Larger → smoother local threshold | 3 – 31 |
-| Remove blobs smaller than (px) | Preprocess | Connected-components area filter | Drops tiny black/white specks before tracing | 10 – 100 |
-| Thicken stencil lines (px) | Preprocess | Morphological dilation on ink | Thicker printable lines | 0.0 – 12.0 |
+| Remove blobs smaller than (px²) | Preprocess | Connected-components area filter | Drops specks whose area is under this many pixels | 10 – 100 |
+| Thicken stencil lines (px) | Preprocess | Morphological dilation of the strokes | 0 is off. Each 1.0 adds about 1px of radius. Grows whichever color covers less of the image, so Invert keeps thickening the same strokes | 0.0 – 12.0 |
 | Invert Image | Preprocess | `bitwise_not` | Swap black/white | — |
 | Preset: max trace fidelity | Vector | Preset | Sets vtracer to minimum simplification (does not make right pane pixel-identical to center) | — |
 | Curve type | Vector | vtracer **`mode`** | Spline / polygon / pixel-accurate paths | combo |
@@ -109,40 +109,9 @@ Even with **Preset: max trace fidelity**, the right pane is **not** a pixel copy
 | Curve fit iterations | Vector | vtracer **`max_iterations`** | More iterations for spline fitting | 1 – 20 |
 | SVG path decimal places | Vector | vtracer **`path_precision`** | Coordinate precision in exported SVG | 1 – 12 |
 
-Sliders update the live vector preview continuously (drag may feel slow on very large/complex photos).
+Sliders do not retrace while you drag. The preview runs when you release the mouse, or after the sliders have been still for 0.3 seconds.
 
 **Tip:** Lower path fidelity + higher “remove blobs” = simpler, bolder stencils that are easier to expose and print.
-
-### Command Line
-
-Two CLI scripts are included for scripting or when you don't need the GUI.
-
-**stencil_creator2.py** (recommended — similar vtracer usage, fewer knobs than the GUI):
-
-```bash
-python stencil_creator2.py photo.jpg \
-    --detail 0.95 \
-    --denoise 18 \
-    --min-area 30 \
-    --output my-stencil
-```
-
-**stencil_creator.py** (older version using the `Vectorizer` class directly):
-
-```bash
-python stencil_creator.py photo.jpg --detail 0.65 --output my-stencil
-```
-
-Both accept the same main flags:
-- `--detail` (float)
-- `--denoise` (int)
-- `--blur` (float)
-- `--threshold` (int)
-- `--min-area` (int)
-- `--invert` (flag)
-- `--output` (base name for output files)
-
-The CLI does not expose all GUI vector options (`max_iterations`, `path_precision`, curve type, etc.).
 
 ## Optional: Inkscape for EPS and PDF Export
 

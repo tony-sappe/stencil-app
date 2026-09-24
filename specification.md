@@ -21,7 +21,7 @@ pillow
 vtracer
 ```
 
-Optional runtime (not pip): `inkscape` on PATH for SVG→PNG previews, EPS/PDF export, modal trace zoom. macOS fallback: `qlmanage` for SVG→PNG only.
+Optional runtime (not pip): `inkscape` on PATH for SVG→PNG previews, EPS/PDF export, modal trace zoom. There is no Quick Look fallback: `qlmanage -t` does not render the stencil frame. If `pillow-heif` is installed it is registered at import so HEIC opens through Pillow.
 
 ## MODULE CONSTANTS
 
@@ -33,7 +33,7 @@ _DETAIL_MAX = 1.0
 _INLINE_RASTER_MAX = 2048      # inkscape --export-width cap for inline vec preview
 _MODAL_RASTER_MAX = 2048       # same for modal vec preview
 _INLINE_TEXTURE_SIZE = 512     # dynamic texture W/H for 3 inline previews
-_PREVIEW_BINARIZE_THRESHOLD = 220  # L<220 → 0 else 255 on rasterized SVG preview
+_PREVIEW_BINARIZE_THRESHOLD = 128  # after white composite, L<128 → ink. Higher fattens AA.
 _PREVIEW_CHILD_PAD_X = 30      # child_window border eats interior; outer W = preview_size + this
 _PREVIEW_CHILD_PAD_Y = 16      # outer H = preview_size + this
 ```
@@ -56,11 +56,11 @@ SAVE_EXTENSIONS = (".svg", ".eps", ".pdf")
 | `current_preprocessed` | str\|None path to preproc PNG temp |
 | `last_svg` | str\|None path to last SVG |
 | `_orig_pil` | PIL RGBA cache of loaded photo |
-| `temp_dir` | `Path(tempfile.gettempdir())` |
-| `preproc_temp` | `{temp_dir}/stencil_creator_preproc.png` |
-| `svg_temp` | `{temp_dir}/stencil_creator_vector.svg` |
-| `vec_preview_temp` | `{temp_dir}/stencil_creator_vecprev.png` |
-| `vec_preview_modal_temp` | `{temp_dir}/stencil_creator_vecprev_modal.png` |
+| `temp_dir` | `tempfile.mkdtemp(prefix="stencil_creator_")`, mode 0700, one per process |
+| `preproc_temp` | `{temp_dir}/preproc.png` (committed only after a successful trace) |
+| `svg_temp` | `{temp_dir}/vector.svg` |
+| `vec_preview_temp` | `{temp_dir}/vecprev.png` |
+| `vec_preview_modal_temp` | `{temp_dir}/vecprev_modal.png` |
 | `texture_size` | 512 |
 | `preview_size` | 470 (image_button W/H) |
 | `preview_child_w` | preview_size + 30 |
@@ -105,13 +105,16 @@ Right pane ≠ pixel copy of center (filled SVG paths + AA + rasterization).
 ## preprocess(img_path, config) → np.ndarray | None
 
 1. **Load gray uint8:**
-   - PIL `Image.open`; modes RGBA/LA/P → L; else non-L → L; `np.array`.
-   - On PIL fail: `cv2.imread` + `COLOR_BGR2GRAY`.
+   - PIL `Image.open`, then `ImageOps.exif_transpose`.
+   - If pixel count exceeds `2 * Image.MAX_IMAGE_PIXELS`, return None. Do not fall through to OpenCV on `DecompressionBombError`.
+   - Composite RGBA/LA (and palette images with transparency) onto white before grayscale. Bare `convert("L")` drops alpha and turns transparent margins into ink.
+   - `I;16` / `I` wider than 8-bit: scale by full range (65535 for 16-bit). Do not `convert("L")` first; that clips at 255.
+   - On other PIL failures: `cv2.imread(..., IMREAD_UNCHANGED)`, reject the same pixel cap, composite BGRA onto white, scale uint16.
    - Return None if both fail.
 
 2. `cv2.fastNlMeansDenoising(gray, h=config["denoise_strength"])`
 
-3. `cv2.GaussianBlur(denoised, (5, 5), config["blur_radius"])` — kernel **fixed** 5×5; slider is **sigma** only.
+3. If `blur_radius <= 0`, skip the blur. OpenCV treats sigma 0 as "derive from the 5×5 kernel" (~1.1), which is stronger than a small positive sigma. Otherwise `cv2.GaussianBlur(denoised, (5, 5), sigma)` — kernel **fixed** 5×5; slider is **sigma** only.
 
 4. `block_size = max(3, int(config["block_size"]) | 1)` — force odd ≥3.
 
@@ -128,8 +131,9 @@ Right pane ≠ pixel copy of center (filled SVG paths + AA + rasterization).
 
 9. `_thicken_ink_lines(cleaned, config["line_width_px"])`:
    - If width_px ≤ 0: return unchanged.
-   - `ksize = max(3, int(round(width_px)) | 1)` odd.
-   - Ellipse kernel dilate on ink mask `(binary==0)`, write back 0/255.
+   - `radius = max(1, int(width_px + 0.5))`, `ksize = radius * 2 + 1`. The old `max(3, round(width)|1)` left 0.1–3.4 on one kernel.
+   - Thicken the strokes: the color with fewer pixels. Invert has already swapped colors, so the stroke color follows the invert. Equal area thickens black (`0`).
+   - Ellipse dilate that mask. Write `0` where dark strokes grew, or `255` where light strokes grew.
 
 Return final binary.
 
@@ -190,30 +194,23 @@ Preprocess **min_area** is separate from vtracer **vector_speckle** (default spe
 
 ---
 
-## SVG → PNG: _render_svg_to_png(svg, png, export_width, timeout) → bool
+## SVG → PNG: _render_svg_to_png(svg, png, export_width, timeout) → (bool, err)
 
 `export_width = max(64, int(export_width))`.
 
-1. **inkscape** (preferred):
-   ```
-   inkscape <svg> --export-type=png --export-filename <png> --export-width=<export_width>
-   ```
-   check=True, capture_output, timeout. Return True if png exists.
-
-2. **qlmanage** (posix only, macOS):
-   `qlmanage -t -s min(export_width,1024) -o <dir> <svg>`
-   Poll 12×0.04s for `{svg_basename}.png` in out_dir → `os.replace` to png_path.
-   Else newest `*.png` in dir with name containing stencil|vector|thumb|preview.
-
-Return False if no file.
+**inkscape** only, in its own process group (`start_new_session`, `killpg` on timeout):
+```
+inkscape <svg> --export-type=png --export-filename <png> --export-width=<export_width>
+```
+Return `(True, "")` if png exists and is non-empty. Otherwise `(False, message)` that distinguishes not installed, timeout, and non-zero exit. Do not scan the temp directory for another PNG.
 
 `_svg_export_width(img_width, max_dim)`: `min(img_width, max_dim)` if img_width>0 else max_dim.
 
 Inline vec: `export_w = _svg_export_width(pw, _INLINE_RASTER_MAX)`; timeout `min(90, 20 + export_w // 80)`.
 
-`_binarize_preview_pil(pil_L)`: gray array; pixels `< 220` → 0 else 255.
+`_load_inkscape_png_as_gray(path)`: PIL open, composite straight alpha onto white, convert L. `convert("L")` alone treats every alpha>0 pixel as solid ink.
 
-`_load_inkscape_png_as_gray(path)`: PIL open convert L or None.
+`_binarize_preview_pil(pil_L)`: gray array; pixels `< 128` → 0 else 255. The modal raster uses the same composite and cutoff.
 
 ---
 
@@ -264,7 +261,9 @@ type from extension if None. ok if file exists and size>0. Errors: not found, Ca
 - `do_preprocess` if no `_last_binary`, input changed, or preprocess_keys changed vs `_last_config`
 - `do_vector` if do_preprocess or vector_keys changed
 - If not do_vector and last_svg exists: reuse svg_temp
-- Else vtracer; on exception set status overflow hint, clear loading_indicator, return
+- Write preprocess to a staging PNG and vtracer to a staging SVG. `cv2.imwrite` must return true. Commit staging over the live temps, `_last_binary`, `_last_input_path`, and `_last_config` only after textures update. On failure, delete staging and leave the previous preview.
+- vtracer `PanicException` subclasses `BaseException`, not `Exception`. Catch it (re-raise `KeyboardInterrupt` / `SystemExit`), show the overflow hint, and do not commit.
+- Set the processing status and `split_frame()` once before the heavy work so the indicator paints. A `_busy` flag stops that frame from starting a second trace; if sliders moved during the run, set `_dirty` again at the end.
 - Build orig_pil from `_orig_pil` cache or `Image.open(input_path)`
 - Vec: render svg at export_w; binarize; fallback proc_pil + status if no inkscape
 - Cache `_preview_cache` copies; `set_value` three textures; `_last_config = dict(config)`; clear loading_indicator
@@ -354,7 +353,7 @@ Hint: "Click any preview to open a full-window view..."
 - Close button → `_close_preview_modal`
 
 **`_open_preview_modal(kind)`** kind ∈ orig|proc|vec:
-- pil from `_preview_cache`; proc resample NEAREST; vec: re-render svg at `_MODAL_RASTER_MAX` width to vec_preview_modal_temp if possible else cache
+- pil from `_preview_cache`; proc resample NEAREST; vec: re-render `last_svg` at `_MODAL_RASTER_MAX` width, composite onto white, binarize at 128; else cache
 - canvas = `(max(320, vw*0.88), max(280, vh*0.78))` from viewport client size
 - `_fit_pil_to_texture_data` → `_replace_modal_texture`
 - caption with title + `{pw}×{ph} px`; show + focus modal
@@ -383,13 +382,13 @@ show=False, callback `_on_save_callback`, default_filename stencil.svg, extensio
 
 ## FILE DIALOG PATH: _extract_path(app_data, require_exists=True)
 
-From dict `app_data`:
-- candidates: file_path_name; selections keys/values; join(current_path, selection); join(current_path, file_name)
-- If require_exists: return first candidate that `os.path.isfile`
-- Else return first candidate string
-- Else return any candidate; else None
+The `.*` filter rewrites `file_path_name` to `name.*`. Selection keys are basenames. Never `isfile` a basename against the process cwd.
 
-Load: require_exists=True. Save: False; if suffix not in SAVE_EXTENSIONS force `.svg`.
+- Candidates, in order: absolute `selections` values; absolute `file_path_name` that does not end in `.*`; `current_path` joined with `file_name` when both are safe.
+- If require_exists: return the first candidate that `os.path.isfile`, else None.
+- Else return the first candidate, else None.
+
+Load: require_exists=True. Save: False; if suffix not in SAVE_EXTENSIONS force `.svg`. Flush a dirty preview before tracing, and do not save when live sliders differ from `_last_config`. Trace with `_last_config`, not a newer unread sample. vtracer errors include `BaseException` panics.
 
 ---
 
@@ -406,19 +405,19 @@ Load: require_exists=True. Save: False; if suffix not in SAVE_EXTENSIONS force `
 
 ## OPEN SVG: open_svg()
 
-target = last_svg or svg_temp if exists; posix `open` else `os.startfile`; status messages.
+target = `last_svg` only when that file exists (set by a trace or save in this process). Do not open a leftover temp SVG. macOS `open`, Windows `os.startfile`, otherwise `xdg-open`.
 
 ---
 
 ## LOAD: _on_load_callback
 
-hide load_dialog; path = extract; set input_path; reset _last_config, _last_binary, _last_slider_change, _last_input_path; load _orig_pil RGBA + immediate orig_texture set_value; status with dimensions; update_preview + _flush_preview_update if dirty.
+hide load_dialog; path = extract; open with the same EXIF / alpha / pixel-cap rules as preprocess. Do not clear `_last_config` or `_last_binary` up front, and do not publish textures until the trace commits. Set `input_path` and run the preview. If `_last_input_path` is not this path afterwards, roll `input_path` and `_orig_pil` back. A failed load must not leave the new photo beside the previous stencil.
 
 ---
 
-## CLEANUP: _on_exit → _cleanup_temps
+## CLEANUP: _on_exit and atexit → _cleanup_temps
 
-unlink preproc_temp, svg_temp, vec_preview_temp, vec_preview_modal_temp if exist.
+`shutil.rmtree` the private temp directory once. Also from `run()`'s `finally`. Idempotent. SIGKILL cannot be cleaned up.
 
 ---
 

@@ -10,15 +10,19 @@ Core flow:
 - 3 live previews: orig photo, exact preproc binary (vtracer input), rasterized SVG preview (approximate); debounced updates
 - Realtime slider/checkbox callbacks update everything
 - Export SVG, EPS, or PDF (user choice; EPS/PDF via Inkscape when installed)
-- Temps isolated to /tmp, cleaned on exit
+- Temps live in a private per-process directory and are removed on exit
 - No Tkinter
 
 This version uses documented DPG dynamic textures (np arrays, not python lists) + slider debounce (process only after you stop moving or release) + mouse-release force for reliable live previews without unnecessary work while dragging.
 """
 
 import argparse
+import atexit
 import os
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -28,7 +32,14 @@ import cv2
 import numpy as np
 import dearpygui.dearpygui as dpg
 import vtracer
-from PIL import Image
+from PIL import Image, ImageOps
+
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
 
 
 def _verbose_log(msg: str, *, verbose: bool) -> None:
@@ -46,10 +57,97 @@ _DETAIL_MAX = 1.0
 _INLINE_RASTER_MAX = 2048
 _MODAL_RASTER_MAX = 2048
 _INLINE_TEXTURE_SIZE = 512
-_PREVIEW_BINARIZE_THRESHOLD = 220  # higher = thinner lines (less AA fattening)
+# Luma below this becomes ink after the raster is composited onto white.
+# 128 matches stroke width; a higher cutoff fattens anti-aliased edges.
+_PREVIEW_BINARIZE_THRESHOLD = 128
 # child_window(border=True) shrinks the interior; pad outer size so image buttons fit without scrollbars
 _PREVIEW_CHILD_PAD_X = 30
 _PREVIEW_CHILD_PAD_Y = 16
+# Pillow raises DecompressionBombError above 2x MAX_IMAGE_PIXELS. OpenCV's own
+# cap is ~2^30 px, so a bomb Pillow refuses must not be handed to cv2.imread.
+_PIL_PIXEL_LIMIT = int(Image.MAX_IMAGE_PIXELS or 89_478_485)
+_MAX_IMAGE_PIXELS = _PIL_PIXEL_LIMIT * 2
+
+
+def _make_work_dir() -> Path:
+    """Mode-0700 directory unique to this process. Callers must delete it."""
+    path = Path(tempfile.mkdtemp(prefix="stencil_creator_"))
+    path.chmod(0o700)
+    return path
+
+
+def _composite_on_white(pil: Image.Image) -> Image.Image:
+    """Straight-alpha images composite onto white. RGB-only convert("L") drops alpha."""
+    if pil.mode == "P" and ("transparency" in pil.info or "A" in pil.getbands()):
+        pil = pil.convert("RGBA")
+    if pil.mode in ("RGBA", "LA"):
+        rgba = pil.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        return Image.alpha_composite(background, rgba)
+    return pil
+
+
+def _scale_to_u8(arr: np.ndarray, full_scale: float) -> np.ndarray:
+    scaled = np.rint(arr.astype(np.float64) * (255.0 / float(full_scale)))
+    return np.clip(scaled, 0, 255).astype(np.uint8)
+
+
+def _pil_to_gray_u8(pil: Image.Image) -> np.ndarray:
+    """Grayscale uint8. Wide modes are scaled, not clipped at 255."""
+    pil = _composite_on_white(pil)
+    if pil.mode in ("I;16", "I;16B", "I;16L", "I;16N"):
+        return _scale_to_u8(np.array(pil), 65535.0)
+    if pil.mode == "I":
+        arr = np.array(pil)
+        peak = float(arr.max()) if arr.size else 0.0
+        if peak <= 255.0:
+            return np.clip(arr, 0, 255).astype(np.uint8)
+        full = 65535.0 if peak <= 65535.0 else max(peak, 1.0)
+        return _scale_to_u8(arr, full)
+    if pil.mode == "F":
+        arr = np.array(pil, dtype=np.float64)
+        peak = float(np.nanmax(arr)) if arr.size else 1.0
+        full = 1.0 if peak <= 1.0 else (65535.0 if peak <= 65535.0 else max(peak, 1.0))
+        return _scale_to_u8(np.nan_to_num(arr, nan=full), full)
+    if pil.mode != "L":
+        pil = pil.convert("L")
+    return np.array(pil, dtype=np.uint8)
+
+
+def _load_raster(path):
+    """Open a source image. Returns (RGBA on white, gray uint8).
+
+    Raises Image.DecompressionBombError when the pixel count is past Pillow's
+    hard limit. Other failures propagate so the caller can try OpenCV.
+    """
+    pil = ImageOps.exif_transpose(Image.open(path))
+    width, height = pil.size
+    if width * height > _MAX_IMAGE_PIXELS:
+        raise Image.DecompressionBombError(
+            f"{width}×{height} exceeds {_MAX_IMAGE_PIXELS} pixels"
+        )
+    return _composite_on_white(pil).convert("RGBA"), _pil_to_gray_u8(pil)
+
+
+def _cv_image_to_gray_u8(img: np.ndarray) -> Optional[np.ndarray]:
+    if img is None:
+        return None
+    if img.ndim == 3 and img.shape[2] == 4:
+        bgra = img
+        if bgra.dtype == np.uint16:
+            bgra = _scale_to_u8(bgra, 65535.0)
+        gray = cv2.cvtColor(bgra[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        alpha = bgra[:, :, 3].astype(np.float32) / 255.0
+        return np.clip(np.rint(gray * alpha + 255.0 * (1.0 - alpha)), 0, 255).astype(np.uint8)
+    if img.dtype == np.uint16:
+        img = _scale_to_u8(img, 65535.0)
+    if img.ndim == 2:
+        if img.dtype == np.uint8:
+            return img
+        return _scale_to_u8(img, float(np.max(img) or 1))
+    if img.ndim == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return None
 
 
 class StencilApp:
@@ -63,12 +161,17 @@ class StencilApp:
         self.last_svg = None
         self._orig_pil = None  # cached for faster repeated updates
 
-        # All temps in system tmp to avoid polluting cwd or source dirs
-        self.temp_dir = Path(tempfile.gettempdir())
-        self.preproc_temp = str(self.temp_dir / "stencil_creator_preproc.png")
-        self.svg_temp = str(self.temp_dir / "stencil_creator_vector.svg")
-        self.vec_preview_temp = str(self.temp_dir / "stencil_creator_vecprev.png")
-        self.vec_preview_modal_temp = str(self.temp_dir / "stencil_creator_vecprev_modal.png")
+        # Private 0700 directory so two copies of the app, and a planted symlink
+        # in the shared temp dir, cannot clobber each other's files.
+        self.temp_dir = _make_work_dir()
+        self._temps_cleaned = False
+        atexit.register(self._cleanup_temps)
+        self.preproc_temp = str(self.temp_dir / "preproc.png")
+        self.preproc_staging = str(self.temp_dir / "preproc_next.png")
+        self.svg_temp = str(self.temp_dir / "vector.svg")
+        self.svg_staging = str(self.temp_dir / "vector_next.svg")
+        self.vec_preview_temp = str(self.temp_dir / "vecprev.png")
+        self.vec_preview_modal_temp = str(self.temp_dir / "vecprev_modal.png")
 
         self.texture_size = _INLINE_TEXTURE_SIZE
         self.preview_size = 470  # preview image button size (letterboxed; preserves aspect ratio)
@@ -87,6 +190,7 @@ class StencilApp:
 
         self._last_config = None
         self._last_binary = None
+        self._busy = False
 
         self._build_ui()
 
@@ -233,7 +337,7 @@ class StencilApp:
                             width=settings_slider_w,
                         )
                         dpg.add_slider_int(
-                            label="Remove blobs smaller than (px)",
+                            label="Remove blobs smaller than (px²)",
                             tag="slider_min_area",
                             default_value=25,
                             min_value=10,
@@ -547,7 +651,7 @@ class StencilApp:
         self.update_preview()
 
     def _binarize_preview_pil(self, pil_img: Image.Image) -> Image.Image:
-        """Re-threshold rasterized SVG; high threshold avoids bloating anti-aliased edges."""
+        """Ink is luma below the cutoff. 128 keeps stroke width; higher fattens AA."""
         arr = np.array(pil_img.convert("L"), dtype=np.uint8)
         return Image.fromarray(
             np.where(arr < _PREVIEW_BINARIZE_THRESHOLD, 0, 255).astype(np.uint8)
@@ -555,7 +659,9 @@ class StencilApp:
 
     def _load_inkscape_png_as_gray(self, png_path: str) -> Optional[Image.Image]:
         try:
-            return Image.open(png_path).convert("L")
+            # Inkscape writes straight-alpha coverage. convert("L") ignores it
+            # and paints every covered pixel as solid ink.
+            return _composite_on_white(Image.open(png_path)).convert("L")
         except Exception:
             return None
 
@@ -605,15 +711,19 @@ class StencilApp:
             pil = self._preview_cache.get("proc")
             resample = Image.NEAREST
         elif kind == "vec":
-            if self.last_svg and os.path.exists(self.svg_temp) and pw > 0:
+            svg_path = self.last_svg
+            if svg_path and os.path.isfile(svg_path) and pw > 0:
                 export_w = self._svg_export_width(pw, _MODAL_RASTER_MAX)
-                if self._render_svg_to_png(
-                    self.svg_temp,
+                ok, _err = self._render_svg_to_png(
+                    svg_path,
                     self.vec_preview_modal_temp,
                     export_width=export_w,
                     timeout=90,
-                ):
-                    pil = self._load_inkscape_png_as_gray(self.vec_preview_modal_temp)
+                )
+                if ok:
+                    raw = self._load_inkscape_png_as_gray(self.vec_preview_modal_temp)
+                    if raw is not None:
+                        pil = self._binarize_preview_pil(raw)
             if pil is None:
                 pil = self._preview_cache.get("vec")
 
@@ -639,25 +749,35 @@ class StencilApp:
             dpg.hide_item("preview_modal")
 
     def preprocess(self, img_path, config):
-        """PIL-first load (broad formats incl. HEIC if pillow-heif installed) then cv2 binary prep."""
+        """PIL-first load (HEIC if pillow-heif registered) then cv2 binary prep."""
         gray = None
         try:
-            pil = Image.open(img_path)
-            if pil.mode in ("RGBA", "LA", "P"):
-                pil = pil.convert("L")
-            elif pil.mode != "L":
-                pil = pil.convert("L")
-            gray = np.array(pil, dtype=np.uint8)
+            _display, gray = _load_raster(img_path)
+        except Image.DecompressionBombError:
+            return None
         except Exception:
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = None
+
+        if gray is None:
+            try:
+                raw = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+            except Exception:
+                return None
+            if raw is None or raw.shape[0] * raw.shape[1] > _MAX_IMAGE_PIXELS:
+                return None
+            gray = _cv_image_to_gray_u8(raw)
 
         if gray is None:
             return None
 
         denoised = cv2.fastNlMeansDenoising(gray, h=config["denoise_strength"])
-        blurred = cv2.GaussianBlur(denoised, (5, 5), config["blur_radius"])
+        # sigma 0 means "derive from the 5×5 kernel" in OpenCV (~1.1), which is
+        # stronger than a small positive sigma. The slider's 0 is no blur.
+        sigma = float(config["blur_radius"])
+        if sigma > 0:
+            blurred = cv2.GaussianBlur(denoised, (5, 5), sigma)
+        else:
+            blurred = denoised
 
         block_size = int(config.get("block_size", 11))
         block_size = max(3, block_size | 1)  # must be odd and >=3
@@ -683,15 +803,27 @@ class StencilApp:
         return cleaned
 
     def _thicken_ink_lines(self, binary: np.ndarray, width_px: float) -> np.ndarray:
-        """Expand dark ink (0) so higher line width = thicker stencil lines on screen."""
+        """Thicken the strokes. Those are whichever color covers less of the image.
+
+        Invert runs before this, so a black line that becomes white is still the
+        smaller region and still grows.
+        """
         if width_px <= 0 or binary is None:
             return binary
-        # Kernel diameter from requested width (odd, at least 3px for visible effect).
-        ksize = max(3, int(round(width_px)) | 1)
+        # Radius tracks the slider. The old max(3, round|1) kernel kept
+        # 0.1 through 3.4 on the same 3×3 ellipse.
+        radius = max(1, int(float(width_px) + 0.5))
+        ksize = radius * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        ink = (binary == 0).astype(np.uint8) * 255
+        dark = int(np.count_nonzero(binary == 0))
+        # Tie (equal area) keeps the usual black ink.
+        if dark <= binary.size - dark:
+            ink = (binary == 0).astype(np.uint8) * 255
+            ink = cv2.dilate(ink, kernel, iterations=1)
+            return np.where(ink > 0, 0, 255).astype(np.uint8)
+        ink = (binary == 255).astype(np.uint8) * 255
         ink = cv2.dilate(ink, kernel, iterations=1)
-        return np.where(ink > 0, 0, 255).astype(np.uint8)
+        return np.where(ink > 0, 255, 0).astype(np.uint8)
 
     def _filter_small_components(self, binary: np.ndarray, min_area: int) -> np.ndarray:
         """Remove small connected components (8-way) of *either* color below min_area by flipping them.
@@ -721,13 +853,40 @@ class StencilApp:
         self._dirty = False
         self._do_update_preview()
 
+    def _run_subprocess(self, args, timeout, check=True):
+        """Run args in their own process group so a timeout kills helpers too."""
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+            try:
+                proc.communicate(timeout=1)
+            except Exception:
+                pass
+            raise
+        if check and proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode, args, output=out, stderr=err
+            )
+        return out, err
+
     def _inkscape_export(self, svg_path, out_path, export_type=None, timeout=60):
         """Convert SVG to another vector format via Inkscape. Returns (ok, error_message)."""
         out_path = str(out_path)
         if export_type is None:
             export_type = Path(out_path).suffix.lstrip(".").lower()
         try:
-            subprocess.run(
+            self._run_subprocess(
                 [
                     "inkscape",
                     svg_path,
@@ -735,9 +894,6 @@ class StencilApp:
                     "--export-filename",
                     out_path,
                 ],
-                check=True,
-                capture_output=True,
-                text=True,
                 timeout=timeout,
             )
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -752,56 +908,76 @@ class StencilApp:
             return False, "inkscape export timed out"
 
     def _render_svg_to_png(self, svg_path, png_path, export_width=380, timeout=30):
-        """Best-effort SVG→PNG. export_width should match bitmap width (capped) for faithful preview.
-        Prefers inkscape (consistent with EPS export). Falls back to macOS qlmanage.
-        Returns True if png_path now exists with useful content.
+        """Rasterize SVG with Inkscape. Returns (ok, error_message).
+
+        Quick Look is not used: its thumbnail is a corner speck, not the stencil,
+        and a filename search in the temp dir can rename the preprocess PNG.
         """
         export_width = max(64, int(export_width))
-        # 1. inkscape (preferred)
         try:
-            subprocess.run(
+            self._run_subprocess(
                 [
                     "inkscape",
                     svg_path,
                     "--export-type=png",
-                    "--export-filename", png_path,
+                    "--export-filename",
+                    png_path,
                     f"--export-width={export_width}",
                 ],
-                check=True,
-                capture_output=True,
                 timeout=timeout,
             )
-            if os.path.exists(png_path):
-                return True
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass
+        except FileNotFoundError:
+            return False, (
+                "Right preview unavailable — install Inkscape to rasterize SVG."
+            )
+        except subprocess.TimeoutExpired:
+            return False, "Inkscape timed out while rasterizing the trace."
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or e.stdout or str(e)).strip()
+            detail = (err or "export failed")[:180]
+            return False, f"Inkscape could not rasterize the trace: {detail}"
+        if not os.path.isfile(png_path) or os.path.getsize(png_path) == 0:
+            return False, "Inkscape did not write a preview PNG."
+        return True, ""
 
-        # 2. qlmanage (macOS built-in)
-        if os.name == "posix":
+    def _trace_to_svg(self, src, dest, config):
+        """Run vtracer. Return None on success, or the error (panics are BaseException)."""
+        try:
+            vtracer.convert_image_to_svg_py(src, dest, **self._vtracer_kwargs(config))
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as exc:
+            return exc
+        return None
+
+    def _discard_staging(self):
+        for path in (getattr(self, "preproc_staging", None), getattr(self, "svg_staging", None)):
             try:
-                out_dir = str(Path(png_path).parent)
-                expected = str(Path(out_dir) / (Path(svg_path).name + ".png"))
-                thumb = min(export_width, 1024)
-                subprocess.run(
-                    ["qlmanage", "-t", "-s", str(thumb), "-o", out_dir, svg_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                for _ in range(12):
-                    if os.path.exists(expected):
-                        os.replace(expected, png_path)
-                        return True
-                    time.sleep(0.04)
-                # last resort: newest plausible thumb in dir
-                for f in sorted(Path(out_dir).glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True):
-                    name = f.name.lower()
-                    if any(k in name for k in ("stencil", "vector", "thumb", "preview")):
-                        os.replace(str(f), png_path)
-                        return True
+                if path and os.path.isfile(path):
+                    os.unlink(path)
             except Exception:
                 pass
-        return False
+
+    def _rearm_if_config_drifted(self, sampled: dict) -> None:
+        """A long trace can drop queued slider callbacks. The widget value is already new."""
+        try:
+            latest = self.get_config()
+        except Exception:
+            return
+        if any(latest.get(key) != sampled.get(key) for key in sampled):
+            self._dirty = True
+            self._last_slider_change = time.time()
+
+    def _preview_matches_sliders(self) -> bool:
+        if not self._last_config or not self.current_preprocessed:
+            return False
+        if not os.path.isfile(self.current_preprocessed):
+            return False
+        try:
+            live = self.get_config()
+        except Exception:
+            return False
+        return all(live.get(key) == self._last_config.get(key) for key in self._last_config)
 
     def update_preview(self, sender=None, app_data=None, user_data=None):
         """Entry point from *every* slider/checkbox change.
@@ -825,13 +1001,27 @@ class StencilApp:
 
     def _do_update_preview(self):
         """Heavy work: preprocess + vtracer + render to texture data.
-        Triggered only after debounce (user stopped moving slider) or mouse release.
-        Skips preprocess when only vector settings change; re-traces from the same binary PNG.
+
+        Files, caches, and textures commit together only after the trace succeeds.
+        A failed trace leaves the previous preview in place.
         """
-        dpg.set_value("loading_indicator", "⏳ Processing...")
-        dpg.set_value("status_text", "Processing…")
+        if self._busy:
+            self._dirty = True
+            self._last_slider_change = time.time()
+            return
+        if not self.input_path:
+            return
+        self._busy = True
+        sampled = None
         try:
+            dpg.set_value("loading_indicator", "⏳ Processing...")
+            dpg.set_value("status_text", "Processing…")
+            try:
+                dpg.split_frame()
+            except Exception:
+                pass
             config = self.get_config()
+            sampled = dict(config)
             preprocess_keys = [
                 "denoise_strength", "blur_radius", "threshold_offset", "invert",
                 "min_area", "block_size", "line_width_px",
@@ -843,93 +1033,92 @@ class StencilApp:
             input_changed = self.input_path != getattr(self, "_last_input_path", None)
             preprocess_config_changed = (
                 self._last_config is None
-                or any(
-                    config[k] != self._last_config.get(k, None)
-                    for k in preprocess_keys
-                )
+                or any(config[k] != self._last_config.get(k, None) for k in preprocess_keys)
             )
             vector_config_changed = (
                 self._last_config is None
-                or any(
-                    config[k] != self._last_config.get(k, None)
-                    for k in vector_keys
-                )
+                or any(config[k] != self._last_config.get(k, None) for k in vector_keys)
             )
             do_preprocess = (
                 self._last_binary is None
                 or input_changed
                 or preprocess_config_changed
+                or not os.path.isfile(self.preproc_temp)
             )
-            do_vector = do_preprocess or vector_config_changed
+            do_vector = (
+                do_preprocess
+                or vector_config_changed
+                or not (self.last_svg and os.path.isfile(self.svg_temp))
+            )
 
+            processed = self._last_binary
+            trace_png = self.preproc_temp
             if do_preprocess:
                 processed = self.preprocess(self.input_path, config)
                 if processed is None:
-                    dpg.set_value("status_text", "Failed to load/process image")
-                    dpg.set_value("loading_indicator", "")
-                    return
-                cv2.imwrite(self.preproc_temp, processed)
-                self.current_preprocessed = self.preproc_temp
-                self._last_binary = processed
-            else:
-                # Reuse previous binary (png is still valid)
-                processed = self._last_binary
-                if processed is None or not os.path.exists(self.preproc_temp):
-                    # fallback
-                    processed = self.preprocess(self.input_path, config)
-                    if processed is None:
-                        dpg.set_value("status_text", "Failed to load/process image")
-                        dpg.set_value("loading_indicator", "")
-                        return
-                    cv2.imwrite(self.preproc_temp, processed)
-                    self.current_preprocessed = self.preproc_temp
-                    self._last_binary = processed
-
-            self._last_input_path = self.input_path
-
-            if not do_vector and self.last_svg and os.path.exists(self.svg_temp):
-                pass  # reuse existing SVG
-            else:
-                try:
-                    vtracer.convert_image_to_svg_py(
-                        self.preproc_temp,
-                        self.svg_temp,
-                        **self._vtracer_kwargs(config),
-                    )
-                except Exception as ve:
                     dpg.set_value(
                         "status_text",
-                        f"Vectorize failed (overflow or bad params): {ve}. "
-                        "Try ↑ Min Area (speckle), ↑ Denoise, or adjust Threshold. Preview not updated.",
+                        "Failed to load/process image. Preview left unchanged.",
                     )
-                    dpg.set_value("loading_indicator", "")
                     return
-                self.last_svg = self.svg_temp
+                if not cv2.imwrite(self.preproc_staging, processed):
+                    dpg.set_value(
+                        "status_text",
+                        "Could not write the stencil bitmap. Preview left unchanged.",
+                    )
+                    return
+                trace_png = self.preproc_staging
 
-            if self._orig_pil is not None:
+            svg_for_preview = self.svg_temp
+            traced_new = False
+            if do_vector:
+                err = self._trace_to_svg(trace_png, self.svg_staging, config)
+                if err is not None:
+                    self._discard_staging()
+                    dpg.set_value(
+                        "status_text",
+                        f"Vectorize failed (overflow or bad params): {err}. "
+                        "Try ↑ Min Area (speckle), ↑ Denoise, or adjust Threshold. "
+                        "Preview left unchanged.",
+                    )
+                    return
+                svg_for_preview = self.svg_staging
+                traced_new = True
+
+            if self._orig_pil is not None and not input_changed:
                 orig_pil = self._orig_pil
             else:
-                orig_pil = Image.open(self.input_path)
+                try:
+                    orig_pil, _gray = _load_raster(self.input_path)
+                except Image.DecompressionBombError:
+                    self._discard_staging()
+                    dpg.set_value(
+                        "status_text",
+                        "Image is too large to open. Downscale it and try again.",
+                    )
+                    return
+                except Exception:
+                    orig_pil = self._orig_pil
             ph, pw = processed.shape[:2]
 
             vec_pil = None
             export_w = self._svg_export_width(pw, _INLINE_RASTER_MAX)
-            if self.last_svg and self._render_svg_to_png(
-                self.svg_temp,
+            rendered, render_err = self._render_svg_to_png(
+                svg_for_preview,
                 self.vec_preview_temp,
                 export_width=export_w,
                 timeout=min(90, 20 + export_w // 80),
-            ):
+            )
+            if rendered:
                 raw = self._load_inkscape_png_as_gray(self.vec_preview_temp)
                 if raw is not None:
                     vec_pil = self._binarize_preview_pil(raw)
 
             if vec_pil is None:
-                dpg.set_value(
-                    "status_text",
-                    "Right preview unavailable — install Inkscape to rasterize SVG "
-                    "(showing center bitmap as fallback)"
+                note = render_err or (
+                    "Right preview unavailable — install Inkscape to rasterize SVG."
                 )
+                dpg.set_value("status_text", f"{note} Showing the stencil bitmap on the right.")
                 vec_pil = Image.fromarray(processed).convert("L")
             else:
                 lt = self._length_threshold_from_detail(config["detail_level"])
@@ -940,98 +1129,137 @@ class StencilApp:
                 )
 
             proc_pil = Image.fromarray(processed).convert("L")
+            if orig_pil is not None:
+                dpg.set_value("orig_texture", self._pil_to_texture_data(orig_pil))
+            dpg.set_value(
+                "proc_texture",
+                self._pil_to_texture_data(proc_pil, resample=Image.NEAREST),
+            )
+            dpg.set_value("vec_texture", self._pil_to_texture_data(vec_pil))
+
+            if do_preprocess:
+                os.replace(self.preproc_staging, self.preproc_temp)
+                self.current_preprocessed = self.preproc_temp
+                self._last_binary = processed
+            if traced_new:
+                os.replace(self.svg_staging, self.svg_temp)
+                self.last_svg = self.svg_temp
+            self._last_input_path = self.input_path
+            if orig_pil is not None:
+                self._orig_pil = orig_pil
             self._image_dims = (pw, ph)
             self._preview_cache["orig"] = orig_pil.copy() if orig_pil else None
             self._preview_cache["proc"] = proc_pil.copy()
-            self._preview_cache["vec"] = vec_pil.copy() if vec_pil is not None else None
-
-            orig_data = self._pil_to_texture_data(orig_pil)
-            proc_data = self._pil_to_texture_data(proc_pil, resample=Image.NEAREST)
-            vec_data = self._pil_to_texture_data(vec_pil)
-
-            dpg.set_value("orig_texture", orig_data)
-            dpg.set_value("proc_texture", proc_data)
-            dpg.set_value("vec_texture", vec_data)
-
-            # Clear loading icon now that vector is ready
-            dpg.set_value("loading_indicator", "")
-
-            # Remember for next time (to skip preprocess on pure vector changes)
+            self._preview_cache["vec"] = vec_pil.copy()
             self._last_config = dict(config)
-
         except Exception as e:
-            dpg.set_value("status_text", f"Preview error: {e}. Try different settings or reload image.")
-            dpg.set_value("loading_indicator", "")
+            self._discard_staging()
+            dpg.set_value(
+                "status_text",
+                f"Preview error: {e}. Previous preview left unchanged.",
+            )
+        finally:
+            self._discard_staging()
+            self._busy = False
+            try:
+                dpg.set_value("loading_indicator", "")
+            except Exception:
+                pass
+            if sampled is not None:
+                self._rearm_if_config_drifted(sampled)
 
     def load_image(self):
         dpg.show_item("load_dialog")
 
     def _extract_path(self, app_data, require_exists=True):
-        """Robust extraction that survived the '.*' filter mangling bug in earlier DPG file_dialog usage."""
+        """Absolute dialog paths only.
+
+        Dear PyGui's `.*` filter rewrites file_path_name to `name.*`, and the
+        selection key is the basename. isfile() on that basename opens a
+        different file in the process cwd. Ignore both.
+        """
         if not isinstance(app_data, dict):
             return None
+        current_path = app_data.get("current_path") or ""
         candidates = []
 
-        p = app_data.get("file_path_name")
-        if isinstance(p, str) and p:
-            candidates.append(p)
-
         selections = app_data.get("selections") or {}
-        current_path = app_data.get("current_path") or ""
-        for k, v in selections.items():
-            for cand in (k, v):
-                if isinstance(cand, str) and cand:
-                    candidates.append(cand)
-                    if current_path:
-                        joined = os.path.join(current_path, cand.lstrip(os.sep + "/\\"))
-                        candidates.append(joined)
+        if isinstance(selections, dict):
+            for value in selections.values():
+                if isinstance(value, str) and os.path.isabs(value):
+                    candidates.append(value)
 
-        fname = app_data.get("file_name")
-        if isinstance(fname, str) and fname and current_path:
-            joined = os.path.join(current_path, fname.lstrip(os.sep + "/\\"))
-            candidates.append(joined)
+        file_path_name = app_data.get("file_path_name")
+        if (
+            isinstance(file_path_name, str)
+            and os.path.isabs(file_path_name)
+            and not file_path_name.endswith(".*")
+        ):
+            candidates.append(file_path_name)
 
-        for cand in candidates:
-            if isinstance(cand, str) and cand:
-                if not require_exists:
-                    return cand
+        file_name = app_data.get("file_name")
+        if (
+            isinstance(file_name, str)
+            and file_name
+            and os.path.isabs(current_path)
+            and not file_name.endswith(".*")
+            and os.sep not in file_name
+            and "/" not in file_name
+            and "\\" not in file_name
+        ):
+            candidates.append(os.path.join(current_path, file_name))
+
+        if require_exists:
+            for cand in candidates:
                 if os.path.isfile(cand):
                     return cand
-
+            return None
         for cand in candidates:
-            if isinstance(cand, str) and cand:
+            if cand:
                 return cand
         return None
 
     def _on_load_callback(self, sender, app_data, user_data):
         dpg.hide_item("load_dialog")
         path = self._extract_path(app_data, require_exists=True)
-        if path:
-            self.input_path = path
-            self._last_config = None
-            self._last_binary = None
-            self._last_slider_change = 0.0
-            self._last_input_path = None
-            try:
-                self._orig_pil = Image.open(path).convert("RGBA")
-                w, h = self._orig_pil.size
-                dpg.set_value("orig_texture", self._pil_to_texture_data(self._orig_pil))
-            except Exception:
-                self._orig_pil = None
+        if not path:
+            dpg.set_value("status_text", "Could not open that file. Choose the image again.")
+            return
+        try:
+            orig, _gray = _load_raster(path)
+        except Image.DecompressionBombError:
+            dpg.set_value(
+                "status_text",
+                "Image is too large to open. Downscale it and try again.",
+            )
+            return
+        except Exception as exc:
+            dpg.set_value("status_text", f"Could not open image: {exc}")
+            return
 
-            dim = ""
-            if self._orig_pil is not None:
-                dim = f" ({self._orig_pil.size[0]}×{self._orig_pil.size[1]} px)"
-            dpg.set_value("status_text", f"Loaded: {Path(path).name}{dim} — updating previews...")
-            self.update_preview()  # marks _dirty + _last_slider_change
-
-            # For the *initial* preview after loading an image we want it right away,
-            # not waiting for the debounce timer.
-            if self._dirty:
-                self._flush_preview_update()
+        # Keep the previous preview until the new trace commits. A failure
+        # rolls the path back so Save cannot export the previous bitmap
+        # under the new photo's name.
+        prev_path = self.input_path
+        prev_orig = self._orig_pil
+        self.input_path = path
+        self._orig_pil = orig
+        width, height = orig.size
+        dpg.set_value(
+            "status_text",
+            f"Loaded: {Path(path).name} ({width}×{height} px) — updating previews...",
+        )
+        self.update_preview()
+        if self._dirty:
+            self._flush_preview_update()
+        if self._last_input_path != path or self._last_config is None:
+            self.input_path = prev_path
+            self._orig_pil = prev_orig
 
     def save_vector(self):
-        if not self.current_preprocessed or not os.path.exists(self.current_preprocessed):
+        if not self.input_path and (
+            not self.current_preprocessed or not os.path.isfile(self.current_preprocessed)
+        ):
             dpg.set_value("status_text", "Load a photo first")
             return
         dpg.show_item("save_dialog")
@@ -1040,6 +1268,15 @@ class StencilApp:
         dpg.hide_item("save_dialog")
         save_path = self._extract_path(app_data, require_exists=False)
         if not save_path:
+            dpg.set_value("status_text", "Save cancelled — no file name.")
+            return
+        if self._dirty and self.input_path:
+            self._flush_preview_update()
+        if not self._preview_matches_sliders():
+            dpg.set_value(
+                "status_text",
+                "Preview does not match these settings, so nothing was saved.",
+            )
             return
         suffix = Path(save_path).suffix.lower()
         if suffix not in self.SAVE_EXTENSIONS:
@@ -1047,19 +1284,18 @@ class StencilApp:
         self._do_save(save_path)
 
     def _do_save(self, save_path):
-        config = self.get_config()
+        config = dict(self._last_config)
         out_path = Path(save_path)
         fmt = out_path.suffix.lower()
         svg_dest = str(out_path) if fmt == ".svg" else self.svg_temp
 
         try:
-            vtracer.convert_image_to_svg_py(
-                self.current_preprocessed,
-                svg_dest,
-                **self._vtracer_kwargs(config),
-            )
-        except Exception as e:
-            dpg.set_value("status_text", f"Vectorize failed: {e}")
+            err = self._trace_to_svg(self.current_preprocessed, svg_dest, config)
+            if err is not None:
+                dpg.set_value("status_text", f"Vectorize failed: {err}")
+                return
+        except Exception as exc:
+            dpg.set_value("status_text", f"Vectorize failed: {exc}")
             return
 
         self.last_svg = svg_dest
@@ -1080,19 +1316,19 @@ class StencilApp:
 
     def open_svg(self):
         target = self.last_svg
-        if (not target or not os.path.exists(target)) and os.path.exists(self.svg_temp):
-            target = self.svg_temp
-        if not target or not os.path.exists(target):
+        if not target or not os.path.isfile(target):
             dpg.set_value("status_text", "No SVG available yet")
             return
         try:
-            if os.name == "posix":
-                subprocess.run(["open", target])
-            else:
+            if sys.platform == "darwin":
+                subprocess.run(["open", target], check=False)
+            elif os.name == "nt":
                 os.startfile(target)
+            else:
+                subprocess.run(["xdg-open", target], check=False)
             dpg.set_value("status_text", f"Opened {Path(target).name}")
-        except Exception as e:
-            dpg.set_value("status_text", f"Could not open SVG: {e}")
+        except Exception as exc:
+            dpg.set_value("status_text", f"Could not open SVG: {exc}")
 
     def _on_global_mouse_release(self, sender=None, app_data=None, user_data=None):
         """Force an immediate preview update when the user releases the mouse after dragging a slider."""
@@ -1124,24 +1360,25 @@ class StencilApp:
         self._schedule_debounce_check()
 
     def _cleanup_temps(self):
-        for p in (
-            getattr(self, "preproc_temp", None),
-            getattr(self, "svg_temp", None),
-            getattr(self, "vec_preview_temp", None),
-            getattr(self, "vec_preview_modal_temp", None),
-        ):
-            try:
-                if p and os.path.exists(p):
-                    os.unlink(p)
-            except Exception:
-                pass
+        if getattr(self, "_temps_cleaned", False):
+            return
+        self._temps_cleaned = True
+        work = getattr(self, "temp_dir", None)
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
 
     def _on_exit(self):
         self._cleanup_temps()
 
     def run(self):
-        dpg.start_dearpygui()
-        dpg.destroy_context()
+        try:
+            dpg.start_dearpygui()
+        finally:
+            self._cleanup_temps()
+            try:
+                dpg.destroy_context()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
